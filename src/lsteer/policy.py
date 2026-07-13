@@ -1,0 +1,156 @@
+"""DiffusionPolicy: obs encoder + conditional U-Net + DDIM sampler + normalizer.
+
+`predict_action` exposes the initial noise `z` as a first-class argument and
+always returns the z it used — with eta=0 the map (obs, z) -> action chunk is
+deterministic, which is the handle Phase 2 (steering encoder) drives and
+Phase 3 (conformal gate, k>1 dispersion) measures.
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Optional
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from lsteer.data import schema
+from lsteer.data.normalizer import LinearNormalizer
+from lsteer.diffusion import DDIMSampler, DiffusionSchedule
+from lsteer.models import ConditionalUnet1D, ObsEncoder
+
+
+@dataclass
+class PolicyConfig:
+    state_dim: int = schema.STATE_DIM
+    action_dim: int = schema.ACTION_DIM
+    obs_horizon: int = 2
+    pred_horizon: int = 8
+    act_horizon: int = 4
+    img_dim: int = 128
+    num_keypoints: int = 32
+    down_dims: tuple[int, ...] = (256, 512, 1024)
+    kernel_size: int = 5
+    diffusion_step_embed_dim: int = 128
+    n_groups: int = 8
+    num_train_timesteps: int = 100
+    num_inference_steps: int = 16
+    clip_sample: bool = True
+
+
+class DiffusionPolicy(nn.Module):
+    def __init__(self, cfg: PolicyConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.obs_encoder = ObsEncoder(
+            state_dim=cfg.state_dim,
+            obs_horizon=cfg.obs_horizon,
+            img_dim=cfg.img_dim,
+            num_keypoints=cfg.num_keypoints,
+        )
+        self.unet = ConditionalUnet1D(
+            input_dim=cfg.action_dim,
+            global_cond_dim=self.obs_encoder.out_dim,
+            diffusion_step_embed_dim=cfg.diffusion_step_embed_dim,
+            down_dims=tuple(cfg.down_dims),
+            kernel_size=cfg.kernel_size,
+            n_groups=cfg.n_groups,
+        )
+        self.schedule = DiffusionSchedule(cfg.num_train_timesteps)
+        self.sampler = DDIMSampler(self.schedule, clip_sample=cfg.clip_sample)
+        self.normalizer = LinearNormalizer()
+
+    # ---------------------------------------------------------------- train
+    def compute_loss(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        """batch: img (B,T_o,3,H,W) in [0,1]; state (B,T_o,D_s); action (B,T_p,A)."""
+        state_n = self.normalizer.normalize("state", batch["state"])
+        action_n = self.normalizer.normalize("action", batch["action"])
+        cond = self.obs_encoder({"img": batch["img"], "state": state_n})
+
+        b = action_n.shape[0]
+        t = torch.randint(0, self.schedule.num_train_timesteps, (b,), device=action_n.device)
+        noise = torch.randn_like(action_n)
+        x_t = self.schedule.q_sample(action_n, t, noise)
+        pred = self.unet(x_t, t, cond)
+        return F.mse_loss(pred, noise)
+
+    # ------------------------------------------------------------ inference
+    @torch.no_grad()
+    def predict_action(
+        self,
+        obs: dict[str, torch.Tensor],
+        *,
+        z: Optional[torch.Tensor] = None,
+        k: int = 1,
+        generator: Optional[torch.Generator] = None,
+        num_steps: Optional[int] = None,
+    ) -> dict[str, torch.Tensor]:
+        """obs: img (T_o,3,H,W) or (1,T_o,3,H,W) in [0,1]; state (T_o,D_s) or (1,T_o,D_s).
+
+        z: optional initial noise (k, T_p, A). If None it is drawn from N(0, I)
+        (via `generator` if given). k > 1 batches K samples over ONE encoded
+        observation — the encoder runs once (the future dispersion-gate path).
+
+        Returns {action: (k,T_a,A), action_pred: (k,T_p,A), z: (k,T_p,A)},
+        unnormalized, on the policy's device.
+        """
+        cfg = self.cfg
+        device = next(self.parameters()).device
+
+        img = obs["img"].to(device)
+        state = obs["state"].to(device)
+        if img.dim() == 4:
+            img = img.unsqueeze(0)
+        if state.dim() == 2:
+            state = state.unsqueeze(0)
+        if img.shape[0] != 1:
+            raise ValueError("predict_action takes a single observation; use k for multiple samples")
+
+        state_n = self.normalizer.normalize("state", state)
+        cond = self.obs_encoder({"img": img, "state": state_n})  # (1, C)
+        cond_k = cond.expand(k, -1)
+
+        if z is None:
+            z = torch.randn((k, cfg.pred_horizon, cfg.action_dim), generator=generator, device=device)
+        else:
+            z = z.to(device)
+            if z.shape != (k, cfg.pred_horizon, cfg.action_dim):
+                raise ValueError(f"z shape {tuple(z.shape)} != {(k, cfg.pred_horizon, cfg.action_dim)}")
+
+        x0 = self.sampler.sample(
+            lambda x, t: self.unet(x, t, cond_k),
+            z.shape,
+            z=z,
+            num_steps=num_steps or cfg.num_inference_steps,
+        )
+        action_pred = self.normalizer.unnormalize("action", x0)
+        start = cfg.obs_horizon - 1
+        action = action_pred[:, start : start + cfg.act_horizon]
+        return {"action": action, "action_pred": action_pred, "z": z}
+
+    # ---------------------------------------------------------------- io
+    def save(self, path: str | Path, extra: Optional[dict] = None) -> None:
+        payload = {
+            "config": asdict(self.cfg),
+            "model": self.state_dict(),
+            "normalizer": self.normalizer.state_dict(),
+        }
+        if extra:
+            payload.update(extra)
+        torch.save(payload, str(path))
+
+    @classmethod
+    def load(cls, path: str | Path, device: str = "cpu", weights: str = "auto") -> "DiffusionPolicy":
+        """weights: 'auto' prefers EMA weights when present; 'model'/'ema' force."""
+        ckpt = torch.load(str(path), map_location="cpu", weights_only=False)
+        cfg_dict = dict(ckpt["config"])
+        cfg_dict["down_dims"] = tuple(cfg_dict["down_dims"])
+        policy = cls(PolicyConfig(**cfg_dict))
+        if weights == "auto":
+            weights = "ema" if "ema" in ckpt else "model"
+        policy.load_state_dict(ckpt[weights])
+        policy.normalizer.load_state_dict(ckpt["normalizer"])
+        policy.schedule.to(device)
+        return policy.to(device).eval()

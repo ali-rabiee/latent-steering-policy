@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lsteer"
+version = "0.1.0"
+description = "Frozen diffusion policy training + latent steering for assistive shared autonomy (Calibrated Latent Steering, Phase 1)"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "einops",
+    "pyyaml",
+    "tqdm",
+    "zarr>=2.16,<3",
+    "numcodecs",
+    "torch>=2.1",
+    "torchvision>=0.16",
+    "imageio",
+]
+
+[project.optional-dependencies]
+train = ["wandb", "tensorboard", "matplotlib"]
+dev = ["pytest", "diffusers", "matplotlib"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

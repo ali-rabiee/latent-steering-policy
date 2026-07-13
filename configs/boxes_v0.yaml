@@ -1,0 +1,41 @@
+# Frozen multimodal diffusion policy v0 — multi-goal colored boxes, 5 Hz
+data:
+  zarr_path: data/boxes_v0.zarr
+  obs_horizon: 2
+  pred_horizon: 8
+  act_horizon: 4
+  crop: 224
+  val_fraction: 0.1
+  split_seed: 42
+  num_workers: 4
+
+model:
+  img_dim: 128
+  num_keypoints: 32
+  down_dims: [256, 512, 1024]
+  kernel_size: 5
+  diffusion_step_embed_dim: 128
+
+diffusion:
+  train_steps: 100
+  infer_steps: 16
+  clip_sample: true
+
+optim:
+  lr: 1.0e-4
+  weight_decay: 1.0e-6
+  batch_size: 64
+  num_steps: 200000
+  warmup_steps: 500
+  ema_inv_gamma: 1.0
+  ema_power: 0.75
+
+log:
+  out_dir: outputs/train
+  logger: tb
+  log_every: 100
+  val_every: 2500
+  ckpt_every: 10000
+
+seed: 0
+device: cuda

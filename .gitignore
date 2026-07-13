@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# data & experiment outputs
+data/
+outputs/
+wandb/
+runs/
+*.zarr/
+*.ckpt
+*.pt
+*.mp4
