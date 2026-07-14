@@ -123,6 +123,15 @@ def reset_sim_and_robot(h: SimHandles) -> None:
     h.robot.reset()
 
 
+def set_arm_joint_positions(h: SimHandles, names: list[str], positions: list[float]) -> None:
+    """Write arm joint positions (e.g. a demo's tick-0 state) into the sim."""
+    ids, _ = h.robot.find_joints(list(names), preserve_order=True)
+    q = h.robot.data.joint_pos.clone()
+    q[0, ids] = torch.tensor(positions, dtype=q.dtype, device=q.device)
+    h.robot.write_joint_state_to_sim(q, torch.zeros_like(h.robot.data.joint_vel))
+    h.robot.reset()
+
+
 def make_twist_controller(h: SimHandles, *, ee_link: str = "j2n6s300_end_effector"):
     from controllers import CartesianVelocityJogConfig, CartesianVelocityJogController
 
@@ -232,10 +241,8 @@ def teleport_box(h: SimHandles, prim_path: str, pos_w: tuple[float, float, float
     tf = torch.tensor(
         [[pos_w[0], pos_w[1], pos_w[2], quat[1], quat[2], quat[3], quat[0]]], device=t0.device
     ).repeat(n, 1)
-    if hasattr(view, "set_transforms"):
-        view.set_transforms(tf)
-    if hasattr(view, "set_linear_velocities"):
-        view.set_linear_velocities(torch.zeros(n, 3, device=t0.device))
-    if hasattr(view, "set_angular_velocities"):
-        view.set_angular_velocities(torch.zeros(n, 3, device=t0.device))
+    idx = torch.arange(n, dtype=torch.int32, device=t0.device)
+    view.set_transforms(tf, indices=idx)
+    if hasattr(view, "set_velocities"):
+        view.set_velocities(torch.zeros(n, 6, device=t0.device), indices=idx)
     return True

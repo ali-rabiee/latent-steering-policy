@@ -12,9 +12,9 @@ Multimodality eval: boxes stay on a FIXED layout across episodes (teleported
 back each reset); only z varies. Per-box coverage of the reached box measures
 steerability of the frozen policy.
 
-Run under Isaac Lab python, e.g.:
-    conda run -n kinova python scripts/rollout_sim.py \
-        --ckpt outputs/train/<run>/latest.ckpt --episodes 50 --headless --enable_cameras
+Run under Isaac Lab python (use -u: Kit swallows buffered stdout on crashes):
+    conda run -n kinova python -u scripts/rollout_sim.py \
+        --ckpt outputs/train/<run>/latest.ckpt --episodes 50 --headless
 """
 
 from __future__ import annotations
@@ -51,6 +51,22 @@ def main() -> int:
     app_launcher = AppLauncher(args)
     simulation_app = app_launcher.app
 
+    code = 1
+    try:
+        code = _run(args)
+    finally:
+        # Kit sometimes wedges in close() headless; give it 60 s then force-exit
+        # with the outcome code (all results were already printed/written).
+        import os
+        import threading
+
+        t = threading.Thread(target=simulation_app.close, daemon=True)
+        t.start()
+        t.join(timeout=60)
+        os._exit(code)
+
+
+def _run(args) -> int:
     from _isaac_bootstrap import bootstrap_kinova
 
     bootstrap_kinova(args.kinova_root)
@@ -76,15 +92,23 @@ def main() -> int:
     provider = runtime.ChunkActionProvider(device=str(h.sim.device))
     controller.set_input_provider(provider)
 
-    for _ in range(20):
-        runtime.step_sim(h, controller, render=True)
+    n_phys = max(1, round((1.0 / schema.FPS) / h.dt))
+    steps_per_episode = int(args.max_duration_s * schema.FPS)
+    # render at ~60 Hz (vla_v1's throttle) — rendering every physics step tanks FPS
+    render_stride = max(1, round((1.0 / 60.0) / h.dt))
+
+    def run_phys_steps(n: int) -> None:
+        """n physics steps, rendering at the throttled rate + always on the last
+        step so a fresh camera frame is available for the next observe()."""
+        for j in range(n):
+            render = ((j + 1) == n) or ((j + 1) % render_stride == 0)
+            runtime.step_sim(h, controller, render=render)
+
+    run_phys_steps(20)
 
     # fixed layout for the whole eval: record spawn poses once
     layout_w = runtime.box_snapshot(h)
     print(f"fixed layout: { {k: np.round(v, 3).tolist() for k, v in layout_w.items()} }")
-
-    n_phys = max(1, round((1.0 / schema.FPS) / h.dt))
-    steps_per_episode = int(args.max_duration_s * schema.FPS)
 
     def observe(gripper_state: float):
         rgb = runtime.capture_rgb(h)
@@ -105,8 +129,7 @@ def main() -> int:
             for p in h.spawned_paths:
                 if p.endswith(leaf):
                     runtime.teleport_box(h, p, tuple(float(v) for v in pos_w))
-        for _ in range(20):
-            runtime.step_sim(h, controller, render=True)
+        run_phys_steps(20)
 
         g_ep = torch.Generator(device=device).manual_seed(args.seed * 100_000 + ep)
         gripper = schema.GRIPPER_OPEN
@@ -149,8 +172,7 @@ def main() -> int:
                     reached_leaf = min(d, key=d.get)
                 gripper = g_cmd
                 provider.set_step(a[0:3], a[3:6], gripper, n_phys)
-                for _ in range(n_phys):
-                    runtime.step_sim(h, controller, render=True)
+                run_phys_steps(n_phys)
                 step += 1
 
                 img, state, _ = observe(gripper)
@@ -201,7 +223,6 @@ def main() -> int:
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     print(f"rollout data -> {out_dir}")
 
-    simulation_app.close()
     return 0
 
 
