@@ -97,9 +97,19 @@ def _run(args) -> int:
     provider = runtime.ChunkActionProvider(device=str(h.sim.device))
     controller.set_input_provider(provider)
 
+    # headless: never render (fast verification). GUI: render at ~60 Hz so the
+    # replay is watchable in the viewport.
+    render_stride = max(1, round((1.0 / 60.0) / h.dt))
+    step_count = [0]
+
+    def do_step() -> None:
+        step_count[0] += 1
+        render = (not args.headless) and (step_count[0] % render_stride == 0)
+        runtime.step_sim(h, controller, render=render)
+
     # settle physics + renderer before teleporting
     for _ in range(10):
-        runtime.step_sim(h, controller, render=False)
+        do_step()
 
     # teleport boxes to the demo layout (world poses from tick 0)
     for obj in demo_objects:
@@ -110,7 +120,7 @@ def _run(args) -> int:
                 ok = runtime.teleport_box(h, p, tuple(pos_w))
                 print(f"teleport {leaf} -> {pos_w} ({'ok' if ok else 'FAILED'})")
     for _ in range(20):
-        runtime.step_sim(h, controller, render=False)
+        do_step()
 
     boxes0 = runtime.box_snapshot(h)
     n_phys = max(1, round((1.0 / 5.0) / h.dt))  # physics steps per 5 Hz action step
@@ -126,7 +136,7 @@ def _run(args) -> int:
     for i, a in enumerate(rec.actions):
         provider.set_step(a[0:3], a[3:6], float(a[6]), n_phys)
         for _ in range(n_phys):
-            runtime.step_sim(h, controller, render=False)
+            do_step()
         if float(a[6]) < 0.0 and prev_g > 0.0 and grasp_dist_to_target is None and target_leaf:
             pos_b, _ = runtime.get_ee_pose_b(h, controller)
             snap = runtime.box_snapshot(h)
@@ -141,7 +151,7 @@ def _run(args) -> int:
 
     # let the grasp settle
     for _ in range(2 * n_phys):
-        runtime.step_sim(h, controller, render=False)
+        do_step()
 
     # ---- verdict --------------------------------------------------------
     # NOTE: demos that end on early_lift_success stop logging right at the
