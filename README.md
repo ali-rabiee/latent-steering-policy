@@ -40,14 +40,17 @@ conda run -n kinova pip install "zarr>=2.16,<3" numcodecs
 ## Workflow
 
 ```bash
-# 1. collect demos with kinova-isaac (multi-goal colored boxes, planner expert)
-cd ../kinova-isaac && python -m data_collection.collect_data \
-  --profile vla_v1 --env ycb_reach_to_grasp --control planner --planner curobo_v2 \
-  --enable_cameras --headless --spawn-mode box --num_objects 4 --box-size 0.05
+# 1. collect demos with kinova-isaac (multi-goal colored boxes, front+wrist cams).
+#    NB: the vla_v1 --planner backends stall at pregrasp; collect_boxes.py is
+#    the working collector (diff-IK expert motion).
+cd ../kinova-isaac && python -u -m data_collection.collect_boxes --headless \
+  --num-objects 4 --num-episodes 40 --seed 0 --logs-root logs/boxes_v0
 
-# 2. convert JSONL+PNG -> zarr (successes only by default)
+# 2. convert JSONL+PNG -> zarr (successes only by default). One image array per
+#    camera; every episode needs an images/<cam>/ dir for each --cameras entry.
 python scripts/convert_to_zarr.py \
-  --logs-root ../kinova-isaac/logs/data_collection --out data/boxes_v0.zarr
+  --logs-root ../kinova-isaac/logs/boxes_v0 --out data/boxes_v0.zarr \
+  --cameras front,wrist
 
 # 3. train (EMA weights are the frozen policy)
 python scripts/train.py --config configs/boxes_v0.yaml
@@ -57,7 +60,7 @@ python scripts/eval_offline.py --ckpt outputs/train/<run>/latest.ckpt --zarr dat
 
 # 5. M6 gate — replay GT demo actions through the twist controller (executor check)
 conda run -n kinova python scripts/replay_open_loop.py \
-  --episode-dir ../kinova-isaac/logs/data_collection/session_X/episode_0000 --headless
+  --episode-dir ../kinova-isaac/logs/boxes_v0/session_X/episode_0000 --headless
 
 # 6. closed-loop eval: success rate + per-box coverage on a fixed layout, z-only variation
 conda run -n kinova python scripts/rollout_sim.py \
@@ -67,6 +70,12 @@ conda run -n kinova python scripts/rollout_sim.py \
 ## Data conventions (single source of truth: `src/lsteer/data/schema.py`)
 
 - 5 Hz policy rate; obs horizon 2, prediction horizon 8, execution horizon 4
+- **cameras**: `front` + `wrist` (`schema.CAMERA_NAMES`), each with its own zarr
+  array `data/img_<cam>`, its own `VisionEncoder` (no weight sharing) and its own
+  random crop. The camera set is stored in the zarr attrs and in the checkpoint,
+  and `rollout_sim.py` builds exactly the cameras the checkpoint names. Rollout
+  MUST call `runtime.sync_cameras()` before each render or the wrist view
+  silently freezes — `step_sim` does this for you
 - state (10): `ee_pos_b(3) + ee_rot6d_b(6) + gripper(1)`; action (7):
   `ee_delta_pos_b(3) + ee_delta_rotvec_b(3) + gripper_setpoint(1)`
 - actions are recomputed from consecutive absolute poses (the logged

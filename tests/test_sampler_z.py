@@ -2,6 +2,7 @@
 
 import torch
 
+from lsteer.data.schema import camera_obs_key
 from lsteer.policy import DiffusionPolicy, PolicyConfig
 
 
@@ -20,10 +21,12 @@ def tiny_policy() -> DiffusionPolicy:
 
 def make_obs(cfg: PolicyConfig) -> dict:
     g = torch.Generator().manual_seed(7)
-    return {
-        "img": torch.rand(cfg.obs_horizon, 3, 96, 96, generator=g),
-        "state": torch.randn(cfg.obs_horizon, cfg.state_dim, generator=g),
+    obs = {
+        camera_obs_key(cam): torch.rand(cfg.obs_horizon, 3, 96, 96, generator=g)
+        for cam in cfg.camera_names
     }
+    obs["state"] = torch.randn(cfg.obs_horizon, cfg.state_dim, generator=g)
+    return obs
 
 
 def test_same_z_same_action():

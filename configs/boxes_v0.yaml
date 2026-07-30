@@ -1,6 +1,7 @@
 # Frozen multimodal diffusion policy v0 — multi-goal colored boxes, 5 Hz
 data:
   zarr_path: data/boxes_v0.zarr
+  camera_names: [front, wrist]
   obs_horizon: 2
   pred_horizon: 8
   act_horizon: 4

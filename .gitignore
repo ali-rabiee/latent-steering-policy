@@ -5,8 +5,11 @@ build/
 dist/
 
 # data & experiment outputs
-data/
-outputs/
+# NOTE: keep these ANCHORED with a leading slash. A bare `data/` matches any
+# directory named data at any depth — it silently excluded the whole
+# src/lsteer/data/ package from git until 2026-07-30.
+/data/
+/outputs/
 wandb/
 runs/
 *.zarr/

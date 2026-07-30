@@ -1,8 +1,10 @@
 """M7: closed-loop evaluation of the frozen diffusion policy in Isaac Sim.
 
-Receding-horizon loop at 5 Hz: capture top-down RGB + EE state (identical
-preprocessing to training via lsteer.data.obs), denoise an action chunk from a
-fresh z, execute act_horizon steps through the twist controller, repeat.
+Receding-horizon loop at 5 Hz: capture every trained camera (front + wrist) +
+EE state (identical preprocessing to training via lsteer.data.obs), denoise an
+action chunk from a fresh z, execute act_horizon steps through the twist
+controller, repeat. The camera set comes from the checkpoint, so a policy can
+never be rolled out against a different set of views than it was trained on.
 
 Every replan's (state, z, predicted chunk) plus the episode outcome is dumped
 to outputs/rollouts/<run>/episode_XXXX.npz — the Phase-2 steering-encoder and
@@ -41,6 +43,12 @@ def main() -> int:
     parser.add_argument("--max-duration-s", type=float, default=20.0)
     parser.add_argument("--lift-thresh", type=float, default=0.06)
     parser.add_argument("--out-dir", type=Path, default=None)
+    parser.add_argument(
+        "--save-frames",
+        action="store_true",
+        help="dump per-camera PNGs per policy step into <out>/episode_XXXX/images/<cam>/, "
+        "the same layout kinova-isaac's make_episode_video.py reads",
+    )
 
     from isaaclab.app import AppLauncher
 
@@ -82,12 +90,15 @@ def _run(args) -> int:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     policy = DiffusionPolicy.load(args.ckpt, device=device)
     cfg = policy.cfg
-    print(f"loaded policy: T_o={cfg.obs_horizon} T_p={cfg.pred_horizon} T_a={cfg.act_horizon}")
+    print(
+        f"loaded policy: T_o={cfg.obs_horizon} T_p={cfg.pred_horizon} "
+        f"T_a={cfg.act_horizon} cameras={list(cfg.camera_names)}"
+    )
 
     out_dir = args.out_dir or Path("outputs/rollouts") / time.strftime("run_%Y%m%d_%H%M%S")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    h = runtime.build_sim(args)
+    h = runtime.build_sim(args, camera_names=cfg.camera_names)
     controller = runtime.make_twist_controller(h)
     provider = runtime.ChunkActionProvider(device=str(h.sim.device))
     controller.set_input_provider(provider)
@@ -110,13 +121,27 @@ def _run(args) -> int:
     layout_w = runtime.box_snapshot(h)
     print(f"fixed layout: { {k: np.round(v, 3).tolist() for k, v in layout_w.items()} }")
 
-    def observe(gripper_state: float):
-        rgb = runtime.capture_rgb(h)
-        assert rgb is not None, "camera returned no frame"
-        img = center_crop(image_to_tensor(resize_to_storage(rgb)))
+    def observe(gripper_state: float, save_to: Path | None = None, tick: int = 0):
+        """One observation: {cam: cropped tensor} + the 10-D low-dim state.
+
+        With save_to set, the RAW camera frames are also written out (the
+        network sees a 224 center crop of a 256 resize of these).
+        """
+        frames = runtime.capture_rgb(h)
+        if save_to is not None:
+            from PIL import Image
+
+            for cam, arr in frames.items():
+                d = save_to / "images" / cam
+                d.mkdir(parents=True, exist_ok=True)
+                Image.fromarray(arr).save(str(d / f"image_{tick:06d}.png"))
+        imgs = {
+            cam: center_crop(image_to_tensor(resize_to_storage(frames[cam])))
+            for cam in cfg.camera_names
+        }
         pos_b, quat_b = runtime.get_ee_pose_b(h, controller)
         state = build_lowdim_obs(pos_b, quat_b, gripper_state)
-        return img, torch.from_numpy(state), pos_b
+        return imgs, torch.from_numpy(state), pos_b
 
     results = []
     for ep in range(args.episodes):
@@ -133,8 +158,9 @@ def _run(args) -> int:
 
         g_ep = torch.Generator(device=device).manual_seed(args.seed * 100_000 + ep)
         gripper = schema.GRIPPER_OPEN
-        img, state, _ = observe(gripper)
-        obs_hist = deque([(img, state)] * cfg.obs_horizon, maxlen=cfg.obs_horizon)
+        frame_dir = (out_dir / f"episode_{ep:04d}") if args.save_frames else None
+        imgs, state, _ = observe(gripper, save_to=frame_dir, tick=0)
+        obs_hist = deque([(imgs, state)] * cfg.obs_horizon, maxlen=cfg.obs_horizon)
 
         replans = []
         reached_leaf = None
@@ -144,9 +170,10 @@ def _run(args) -> int:
         step = 0
         while step < steps_per_episode:
             obs = {
-                "img": torch.stack([f for f, _ in obs_hist]),
-                "state": torch.stack([s for _, s in obs_hist]),
+                schema.camera_obs_key(cam): torch.stack([f[cam] for f, _ in obs_hist])
+                for cam in cfg.camera_names
             }
+            obs["state"] = torch.stack([s for _, s in obs_hist])
             out = policy.predict_action(obs, k=1, generator=g_ep)  # fresh z per replan
             actions = out["action"][0].cpu().numpy()  # (T_a, 7)
             replans.append(
@@ -175,8 +202,8 @@ def _run(args) -> int:
                 run_phys_steps(n_phys)
                 step += 1
 
-                img, state, _ = observe(gripper)
-                obs_hist.append((img, state))
+                imgs, state, _ = observe(gripper, save_to=frame_dir, tick=step)
+                obs_hist.append((imgs, state))
 
                 snap = runtime.box_snapshot(h)
                 lifts = {k: float(snap[k][2] - boxes0[k][2]) for k in snap if k in boxes0}

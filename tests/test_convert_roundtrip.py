@@ -3,6 +3,11 @@
 Checks the whole causal chain: integrating the recomputed actions from the
 first pose must recover the logged pose sequence, and the recomputed deltas
 must match the logged `action_from_prev` (modulo quaternion-sign canonics).
+
+These pilot episodes predate the per-camera image layout (they have a flat
+`images/` dir), so they are parsed with `camera_names=()` — the low-dim stream
+is what is under test here. The per-camera image path is covered by
+test_multicamera.py against the boxes_v0 logs.
 """
 
 import json
@@ -22,7 +27,7 @@ pytestmark = pytest.mark.skipif(not LOGS_ROOT.exists(), reason="pilot logs not f
 
 def first_episode():
     for ep_dir in discover_episodes(LOGS_ROOT):
-        rec = parse_episode(ep_dir, require_success=False)
+        rec = parse_episode(ep_dir, require_success=False, camera_names=())
         if rec is not None:
             return rec, ep_dir
     pytest.skip("no parseable episode in pilot logs")

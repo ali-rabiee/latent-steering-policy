@@ -12,10 +12,15 @@ from typing import Optional
 
 import yaml
 
+from lsteer.data.schema import CAMERA_NAMES as SCHEMA_CAMERA_NAMES
+
 
 @dataclass
 class DataConfig:
     zarr_path: str = "data/boxes_v0.zarr"
+    # cameras to train on; must all exist in the zarr. Empty = use whatever the
+    # zarr was converted with (recorded in its attrs).
+    camera_names: list[str] = field(default_factory=lambda: list(SCHEMA_CAMERA_NAMES))
     obs_horizon: int = 2
     pred_horizon: int = 8
     act_horizon: int = 4

@@ -66,6 +66,7 @@ class Trainer:
             pred_horizon=cfg.data.pred_horizon,
             act_horizon=cfg.data.act_horizon,
             crop_size=cfg.data.crop,
+            camera_names=tuple(cfg.data.camera_names) or None,
         )
         self.train_set = ZarrChunkDataset(cfg.data.zarr_path, episode_ids=self.train_eps, train=True, **common)
         self.val_set = (
@@ -89,7 +90,9 @@ class Trainer:
         )
 
         # model ---------------------------------------------------------------
+        # the dataset is the authority on which cameras are actually present
         policy_cfg = PolicyConfig(
+            camera_names=self.train_set.camera_names,
             obs_horizon=cfg.data.obs_horizon,
             pred_horizon=cfg.data.pred_horizon,
             act_horizon=cfg.data.act_horizon,
@@ -150,7 +153,7 @@ class Trainer:
 
             # denoise a full chunk per sample and compare to GT actions
             state_n = ema_policy.normalizer.normalize("state", batch["state"])
-            cond = ema_policy.obs_encoder({"img": batch["img"], "state": state_n})
+            cond = ema_policy._encode_obs(batch, state_n)
             z = torch.randn(
                 (cond.shape[0], ema_policy.cfg.pred_horizon, ema_policy.cfg.action_dim), device=device
             )

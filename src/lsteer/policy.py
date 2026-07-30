@@ -26,6 +26,7 @@ from lsteer.models import ConditionalUnet1D, ObsEncoder
 class PolicyConfig:
     state_dim: int = schema.STATE_DIM
     action_dim: int = schema.ACTION_DIM
+    camera_names: tuple[str, ...] = schema.CAMERA_NAMES
     obs_horizon: int = 2
     pred_horizon: int = 8
     act_horizon: int = 4
@@ -49,6 +50,7 @@ class DiffusionPolicy(nn.Module):
             obs_horizon=cfg.obs_horizon,
             img_dim=cfg.img_dim,
             num_keypoints=cfg.num_keypoints,
+            camera_names=cfg.camera_names,
         )
         self.unet = ConditionalUnet1D(
             input_dim=cfg.action_dim,
@@ -62,12 +64,20 @@ class DiffusionPolicy(nn.Module):
         self.sampler = DDIMSampler(self.schedule, clip_sample=cfg.clip_sample)
         self.normalizer = LinearNormalizer()
 
+    # ------------------------------------------------------------ obs plumbing
+    def _encode_obs(self, obs: dict[str, torch.Tensor], state_n: torch.Tensor) -> torch.Tensor:
+        """Build the encoder input from the img_<cam> entries + normalized state."""
+        enc_in = {schema.camera_obs_key(c): obs[schema.camera_obs_key(c)] for c in self.cfg.camera_names}
+        enc_in["state"] = state_n
+        return self.obs_encoder(enc_in)
+
     # ---------------------------------------------------------------- train
     def compute_loss(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
-        """batch: img (B,T_o,3,H,W) in [0,1]; state (B,T_o,D_s); action (B,T_p,A)."""
+        """batch: img_<cam> (B,T_o,3,H,W) in [0,1] per camera; state (B,T_o,D_s);
+        action (B,T_p,A)."""
         state_n = self.normalizer.normalize("state", batch["state"])
         action_n = self.normalizer.normalize("action", batch["action"])
-        cond = self.obs_encoder({"img": batch["img"], "state": state_n})
+        cond = self._encode_obs(batch, state_n)
 
         b = action_n.shape[0]
         t = torch.randint(0, self.schedule.num_train_timesteps, (b,), device=action_n.device)
@@ -87,7 +97,8 @@ class DiffusionPolicy(nn.Module):
         generator: Optional[torch.Generator] = None,
         num_steps: Optional[int] = None,
     ) -> dict[str, torch.Tensor]:
-        """obs: img (T_o,3,H,W) or (1,T_o,3,H,W) in [0,1]; state (T_o,D_s) or (1,T_o,D_s).
+        """obs: img_<cam> (T_o,3,H,W) or (1,T_o,3,H,W) in [0,1] for every camera
+        in cfg.camera_names; state (T_o,D_s) or (1,T_o,D_s).
 
         z: optional initial noise (k, T_p, A). If None it is drawn from N(0, I)
         (via `generator` if given). k > 1 batches K samples over ONE encoded
@@ -99,17 +110,23 @@ class DiffusionPolicy(nn.Module):
         cfg = self.cfg
         device = next(self.parameters()).device
 
-        img = obs["img"].to(device)
+        imgs = {}
+        for cam in cfg.camera_names:
+            key = schema.camera_obs_key(cam)
+            if key not in obs:
+                raise KeyError(f"observation is missing '{key}' (cameras: {cfg.camera_names})")
+            img = obs[key].to(device)
+            if img.dim() == 4:
+                img = img.unsqueeze(0)
+            if img.shape[0] != 1:
+                raise ValueError("predict_action takes a single observation; use k for multiple samples")
+            imgs[key] = img
         state = obs["state"].to(device)
-        if img.dim() == 4:
-            img = img.unsqueeze(0)
         if state.dim() == 2:
             state = state.unsqueeze(0)
-        if img.shape[0] != 1:
-            raise ValueError("predict_action takes a single observation; use k for multiple samples")
 
         state_n = self.normalizer.normalize("state", state)
-        cond = self.obs_encoder({"img": img, "state": state_n})  # (1, C)
+        cond = self._encode_obs(imgs, state_n)  # (1, C)
         cond_k = cond.expand(k, -1)
 
         if z is None:
@@ -147,6 +164,7 @@ class DiffusionPolicy(nn.Module):
         ckpt = torch.load(str(path), map_location="cpu", weights_only=False)
         cfg_dict = dict(ckpt["config"])
         cfg_dict["down_dims"] = tuple(cfg_dict["down_dims"])
+        cfg_dict["camera_names"] = tuple(cfg_dict.get("camera_names", schema.CAMERA_NAMES))
         policy = cls(PolicyConfig(**cfg_dict))
         if weights == "auto":
             weights = "ema" if "ema" in ckpt else "model"

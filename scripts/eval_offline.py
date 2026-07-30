@@ -61,10 +61,12 @@ def main() -> int:
         obs_horizon=policy.cfg.obs_horizon,
         pred_horizon=policy.cfg.pred_horizon,
         act_horizon=policy.cfg.act_horizon,
+        camera_names=policy.cfg.camera_names,
         train=False,
     )
     sample = ds[min(args.frame, len(ds) - 1)]
-    obs = {"img": sample["img"], "state": sample["state"]}
+    obs = {schema.camera_obs_key(c): sample[schema.camera_obs_key(c)] for c in policy.cfg.camera_names}
+    obs["state"] = sample["state"]
 
     box_pos = np.asarray(root[schema.META_BOX_POSITIONS][ep])  # (4,3) NaN-padded
     box_colors = np.asarray(root[schema.META_BOX_COLORS][ep])

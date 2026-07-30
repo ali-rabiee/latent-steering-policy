@@ -1,8 +1,14 @@
 """Shared Isaac-side runtime for policy replay/rollout in the kinova-isaac sim.
 
-Everything here mirrors data_collection/profiles/vla_v1.py's setup so the
+Everything here mirrors data_collection/collect_boxes.py's setup so the
 deployment-time observation/actuation path matches the one the demos were
 logged under. All heavy imports are deferred to call time (Kit must be up).
+
+Cameras: the SAME set the policy was trained on (front + wrist by default),
+built through kinova-isaac's camera package so the geometry cannot drift from
+the collector's. The wrist camera is NOT parented to the arm — `step_sim` must
+call `sync_wrist_camera_to_ee` before every render or it silently produces a
+static view (see PLAN.md gotcha 1).
 """
 
 from __future__ import annotations
@@ -13,6 +19,8 @@ from typing import Optional
 
 import numpy as np
 import torch
+
+from lsteer.data import schema
 
 BOX_COLORS: list[tuple[str, tuple[float, float, float]]] = [
     ("red", (0.85, 0.20, 0.20)),
@@ -29,23 +37,30 @@ class SimHandles:
     sim: object
     env: object
     robot: object
-    camera_sensor: object | None
+    cameras: dict[str, object]
     dt: float
     scene_origins: object
     spawned_paths: list[str] = field(default_factory=list)
     id_to_label: dict[str, str] = field(default_factory=dict)
     tracker: object | None = None
+    wrist_cfg: object | None = None
 
 
-def build_sim(args, *, spawn_min=(0.30, -0.30, 0.90), spawn_max=(0.55, 0.30, 0.95)) -> SimHandles:
-    """Build scene + robot + top-down camera + boxes, then reset. Mirrors vla_v1.run()."""
+def build_sim(
+    args,
+    *,
+    spawn_min=(0.30, -0.30, 0.90),
+    spawn_max=(0.55, 0.30, 0.95),
+    camera_names=schema.CAMERA_NAMES,
+) -> SimHandles:
+    """Build scene + robot + cameras + boxes, then reset. Mirrors collect_boxes.py."""
     import carb
-    from isaaclab.sensors import Camera, CameraCfg
 
     from data_collection.core.objects import ObjectsTracker
+    from environments.utils.camera import DEFAULT_WRIST_CAMERA, build_camera
     from environments.utils.object_loader import ObjectLoader, ObjectLoaderConfig, SpawnBounds
     from environments.utils.physix import object_loader_kwargs_from_physix
-    from environments.ycb_reach_to_grasp import DEFAULT_TOP_DOWN_CAMERA, YCBReachToGraspEnv
+    from environments.ycb_reach_to_grasp import YCBReachToGraspEnv
 
     enable_cameras = bool(getattr(args, "enable_cameras", True))
     carb.settings.get_settings().set_bool("/isaaclab/cameras_enabled", enable_cameras)
@@ -56,8 +71,6 @@ def build_sim(args, *, spawn_min=(0.30, -0.30, 0.90), spawn_max=(0.55, 0.30, 0.9
         env.set_default_camera_view()
     env.design_scene()
     robot = env.robot
-    if enable_cameras:
-        env.attach_top_down_camera()
 
     # boxes (spawn_mode="box", fixed size, deterministic color per index)
     num_objects = int(getattr(args, "num_objects", 4))
@@ -82,32 +95,31 @@ def build_sim(args, *, spawn_min=(0.30, -0.30, 0.90), spawn_max=(0.55, 0.30, 0.9
         idx = int(leaf.split("_")[-1])
         id_to_label[leaf] = f"{BOX_COLORS[(idx - 1) % len(BOX_COLORS)][0]} box {idx}"
 
-    camera_sensor = None
-    if enable_cameras and DEFAULT_TOP_DOWN_CAMERA is not None:
-        camera_cfg = CameraCfg(
-            prim_path=DEFAULT_TOP_DOWN_CAMERA.prim_path,
-            offset=CameraCfg.OffsetCfg(pos=(0.0, 0.0, 0.0), rot=(1.0, 0.0, 0.0, 0.0)),
-            spawn=None,
-            data_types=["rgb"],
-            width=DEFAULT_TOP_DOWN_CAMERA.resolution[0],
-            height=DEFAULT_TOP_DOWN_CAMERA.resolution[1],
-        )
-        camera_sensor = Camera(cfg=camera_cfg)
+    # cameras MUST be built before the first reset (a render product created
+    # afterwards hard-crashes Kit, silently — see PLAN.md gotcha 4).
+    # Deliberately no try/except around build_camera the way collect_boxes.py
+    # has: at rollout a missing view is a train/deploy mismatch, not something
+    # to continue past.
+    cameras: dict[str, object] = {}
+    if enable_cameras:
+        for name in camera_names:
+            cameras[name] = build_camera(name, robot=robot)
 
     handles = SimHandles(
         sim=sim,
         env=env,
         robot=robot,
-        camera_sensor=camera_sensor,
+        cameras=cameras,
         dt=float(sim.get_physics_dt()),
         scene_origins=env.scene_origins,
         spawned_paths=list(spawned_paths),
         id_to_label=id_to_label,
         tracker=ObjectsTracker(prim_paths=list(spawned_paths)),
+        wrist_cfg=DEFAULT_WRIST_CAMERA,
     )
     reset_sim_and_robot(handles)
-    if camera_sensor is not None:
-        camera_sensor.reset()
+    for cam in cameras.values():
+        cam.reset()
     return handles
 
 
@@ -193,26 +205,58 @@ def get_ee_pose_b(h: SimHandles, controller) -> tuple[np.ndarray, np.ndarray]:
     return pos_b[0].cpu().numpy(), quat_b[0].cpu().numpy()
 
 
-def capture_rgb(h: SimHandles) -> Optional[np.ndarray]:
-    """Latest top-down RGB frame as uint8 HWC, or None."""
-    if h.camera_sensor is None:
-        return None
-    data = h.camera_sensor.data
+def _sensor_rgb(sensor) -> Optional[np.ndarray]:
+    """One sensor's latest RGB frame as uint8 HWC, or None. Same normalization
+    as collect_boxes.py's _capture_and_log, so training/rollout pixels match."""
+    data = sensor.data
     rgb = data.output.get("rgb") if data.output is not None else None
     if rgb is None:
         return None
     arr = rgb[0].cpu().numpy() if rgb.dim() == 4 else rgb.cpu().numpy()
+    arr = arr[..., :3]
     if arr.dtype != np.uint8:
         arr = (arr * 255).astype(np.uint8) if arr.max() <= 1.0 else arr.astype(np.uint8)
-    return arr[..., :3]
+    return arr
+
+
+def capture_rgb(h: SimHandles) -> dict[str, np.ndarray]:
+    """{camera name: latest RGB frame (uint8 HWC)} for every built camera.
+
+    Raises if a camera has no frame yet: a silently-missing view would be a
+    train/deploy mismatch the policy cannot report.
+    """
+    out = {}
+    for name, sensor in h.cameras.items():
+        arr = _sensor_rgb(sensor)
+        if arr is None:
+            raise RuntimeError(f"camera {name!r} returned no frame (was the last step rendered?)")
+        out[name] = arr
+    return out
+
+
+def sync_cameras(h: SimHandles) -> None:
+    """Pose-update pass that must run BEFORE the render that produces a frame.
+
+    Only the wrist camera needs it, and it needs it EVERY render: the prim is
+    unparented (PhysX never pushes link motion into USD), so without this it
+    stays frozen at its spawn pose and the "wrist" view is a lie.
+    """
+    if "wrist" not in h.cameras:
+        return
+    from environments.utils.camera import sync_wrist_camera_to_ee
+
+    sync_wrist_camera_to_ee(h.robot, h.cameras["wrist"], h.wrist_cfg)
 
 
 def step_sim(h: SimHandles, controller, *, render: bool) -> None:
     controller.step(h.robot, h.dt)
+    if render:
+        sync_cameras(h)
     h.sim.step(render=render)
     h.robot.update(h.dt)
-    if render and h.camera_sensor is not None:
-        h.camera_sensor.update(h.dt)
+    if render:
+        for sensor in h.cameras.values():
+            sensor.update(h.dt)
 
 
 def box_snapshot(h: SimHandles) -> dict[str, np.ndarray]:

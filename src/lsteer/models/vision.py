@@ -10,6 +10,8 @@ import torch
 import torch.nn as nn
 import torchvision
 
+from lsteer.data import schema
+
 
 def _replace_bn_with_gn(module: nn.Module, features_per_group: int = 16) -> nn.Module:
     for name, child in module.named_children():
@@ -74,19 +76,43 @@ class VisionEncoder(nn.Module):
 
 
 class ObsEncoder(nn.Module):
-    """Encodes an observation window {img: (B,T_o,3,H,W), state: (B,T_o,D_s)}
-    into a single global conditioning vector (B, T_o*(img_dim + D_s))."""
+    """Encodes a multi-camera observation window into one global conditioning
+    vector.
 
-    def __init__(self, state_dim: int, obs_horizon: int, img_dim: int = 128, num_keypoints: int = 32):
+    obs: {img_<cam>: (B,T_o,3,H,W) for each camera, state: (B,T_o,D_s)}
+      -> (B, T_o*(img_dim*n_cams + D_s))
+
+    Each camera gets its OWN VisionEncoder (no weight sharing): the front and
+    wrist views have completely different statistics and a shared trunk would
+    have to straddle both. Per-camera features are concatenated in the fixed
+    `camera_names` order, then concatenated with the state, per timestep.
+    """
+
+    def __init__(
+        self,
+        state_dim: int,
+        obs_horizon: int,
+        img_dim: int = 128,
+        num_keypoints: int = 32,
+        camera_names=schema.CAMERA_NAMES,
+    ):
         super().__init__()
-        self.vision = VisionEncoder(num_keypoints=num_keypoints, out_dim=img_dim)
+        self.camera_names = tuple(camera_names)
+        self.vision = nn.ModuleDict(
+            {cam: VisionEncoder(num_keypoints=num_keypoints, out_dim=img_dim) for cam in self.camera_names}
+        )
         self.state_dim = state_dim
         self.obs_horizon = obs_horizon
-        self.out_dim = obs_horizon * (img_dim + state_dim)
+        self.out_dim = obs_horizon * (img_dim * len(self.camera_names) + state_dim)
 
     def forward(self, obs: dict[str, torch.Tensor]) -> torch.Tensor:
-        img = obs["img"]  # (B, T_o, 3, H, W)
         state = obs["state"]  # (B, T_o, D_s)
-        b, t = img.shape[:2]
-        img_feat = self.vision(img.flatten(0, 1)).reshape(b, t, -1)
-        return torch.cat([img_feat, state], dim=-1).flatten(1)
+        feats = []
+        for cam in self.camera_names:
+            key = schema.camera_obs_key(cam)
+            if key not in obs:
+                raise KeyError(f"observation is missing '{key}' (cameras: {self.camera_names})")
+            img = obs[key]  # (B, T_o, 3, H, W)
+            b, t = img.shape[:2]
+            feats.append(self.vision[cam](img.flatten(0, 1)).reshape(b, t, -1))
+        return torch.cat(feats + [state], dim=-1).flatten(1)
