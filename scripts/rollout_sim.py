@@ -145,8 +145,12 @@ def _run(args) -> int:
 
     results = []
     for ep in range(args.episodes):
-        # reset robot + teleport boxes back to the fixed layout
+        # reset robot + teleport boxes back to the fixed layout.
+        # set_home_pose BEFORE controller.reset: every demo starts at the home
+        # pose, and reset_sim_and_robot alone does not land there. Skipping it
+        # starts each episode out of distribution (see runtime.set_home_pose).
         runtime.reset_sim_and_robot(h)
+        runtime.set_home_pose(h)
         controller.reset(h.robot)
         controller.set_mode("twist")
         provider.set_step(np.zeros(3), np.zeros(3), schema.GRIPPER_OPEN, 1)
@@ -157,6 +161,15 @@ def _run(args) -> int:
         run_phys_steps(20)
 
         g_ep = torch.Generator(device=device).manual_seed(args.seed * 100_000 + ep)
+        # ONE z for the whole episode. z selects the behavioural mode (which box,
+        # and implicitly which phase of the reach->descend->close->lift script),
+        # so redrawing it every replan lets the policy jump modes mid-episode --
+        # observed closing the gripper at replan 1, 24 cm above the table, then
+        # executing the lift. PLAN.md's M7 protocol is "only z varies" ACROSS
+        # episodes, with the layout fixed: that is one sample per episode.
+        z_ep = torch.randn(
+            (1, cfg.pred_horizon, cfg.action_dim), generator=g_ep, device=device
+        )
         gripper = schema.GRIPPER_OPEN
         frame_dir = (out_dir / f"episode_{ep:04d}") if args.save_frames else None
         imgs, state, _ = observe(gripper, save_to=frame_dir, tick=0)
@@ -174,7 +187,7 @@ def _run(args) -> int:
                 for cam in cfg.camera_names
             }
             obs["state"] = torch.stack([s for _, s in obs_hist])
-            out = policy.predict_action(obs, k=1, generator=g_ep)  # fresh z per replan
+            out = policy.predict_action(obs, z=z_ep, k=1)  # z held fixed for the episode
             actions = out["action"][0].cpu().numpy()  # (T_a, 7)
             replans.append(
                 {

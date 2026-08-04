@@ -3,7 +3,9 @@ __pycache__/
 *.egg-info/
 build/
 dist/
-
+docs/
+slurm/
+data/
 # data & experiment outputs
 # NOTE: keep these ANCHORED with a leading slash. A bare `data/` matches any
 # directory named data at any depth — it silently excluded the whole

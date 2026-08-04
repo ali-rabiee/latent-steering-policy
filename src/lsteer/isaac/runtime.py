@@ -144,14 +144,46 @@ def set_arm_joint_positions(h: SimHandles, names: list[str], positions: list[flo
     h.robot.reset()
 
 
+ARM_JOINT_NAMES = [f"j2n6s300_joint_{i}" for i in range(1, 7)]
+
+
+def set_home_pose(h: SimHandles) -> None:
+    """Put the arm at the SAME home pose every demo starts from.
+
+    `reset_sim_and_robot` writes the articulation's default joint state, which
+    is NOT the configured home pose the collector starts every episode at. A
+    rollout that skips this begins out of distribution, and behaviour cloning
+    compounds the error from the first step. Call this BEFORE `controller.reset`
+    so the controller anchors its hold state to the correct pose.
+    """
+    from environments.base import default_jaco2_home_pose
+
+    home = default_jaco2_home_pose()
+    set_arm_joint_positions(h, ARM_JOINT_NAMES, [float(home[n]) for n in ARM_JOINT_NAMES])
+
+
 def make_twist_controller(h: SimHandles, *, ee_link: str = "j2n6s300_end_effector"):
     from controllers import CartesianVelocityJogConfig, CartesianVelocityJogController
 
+    # workspace_min x MUST sit below the demos' minimum EE x (0.1647 measured
+    # over the boxes_v0 campaign), otherwise the controller fights the policy.
+    #
+    # The jog controller clamps its IK target to this box EVERY step, including
+    # when the command is zero: pos_des = clamp(ee_pos_b + dpos). The robot's
+    # home pose is x=0.165, so with the old x_min=0.20 the controller solved IK
+    # toward a target 3.5 cm away and drove the arm to the boundary before the
+    # policy ever acted -- 4.7 cm of drift at reset, 6.7 cm by the time replay
+    # started executing. 10.6% of all demo ticks are below 0.20 and were logged
+    # with workspace_clamped_axes[0] = true.
+    #
+    # Collection is immune because collect_boxes.py drives DifferentialIKController
+    # directly with absolute poses and applies NO workspace clamp; the clamp is a
+    # teleoperation safety feature that does not belong in the replay path.
     cfg = CartesianVelocityJogConfig(
         ee_link_name=ee_link,
         device=str(h.sim.device),
         use_relative_mode=True,
-        workspace_min=(0.20, -0.45, 0.0),
+        workspace_min=(0.15, -0.45, 0.0),
         workspace_max=(0.6, 0.45, 1.20),
     )
     controller = CartesianVelocityJogController(cfg, num_envs=1, device=str(h.sim.device))
