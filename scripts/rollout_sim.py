@@ -76,6 +76,15 @@ def main() -> int:
         "they have drifted ~16 cm away. 0 = off.",
     )
     parser.add_argument(
+        "--latch-gripper",
+        action="store_true",
+        help="E3c: once the gripper has closed (under whatever gates are active), keep "
+        "it closed for the rest of the episode. The predicted gripper channel is bimodal "
+        "+/-1 noise, so it flips back open within a replan or two: in the 10 E3b episodes "
+        "that closed at a correct grasp pose the arm then lifted 0.41-0.56 m -- far past "
+        "the 0.06 m success threshold -- but had already dropped the box.",
+    )
+    parser.add_argument(
         "--steer-to-box",
         action="store_true",
         help="E1b: instead of committing to the policy's own first endpoint, "
@@ -226,6 +235,7 @@ def _run(args) -> int:
         # of how far the target is -- that makes it a measure of gripper timing,
         # not of which box the arm actually travelled to. This one is timing-free.
         closest = {k: float("inf") for k in boxes_xy_b}
+        latched = False
         commit_xy = None  # E1 mode-lock: xy endpoint committed at the first replan
         commanded_leaf = None
         goal_vec = None
@@ -297,6 +307,11 @@ def _run(args) -> int:
                     too_high = args.close_max_height > 0.0 and float(pos_now[2]) > args.close_max_height
                     if too_far or too_high:
                         g_cmd = schema.GRIPPER_OPEN  # not on the box yet
+                if args.latch_gripper:
+                    if g_cmd == schema.GRIPPER_CLOSE:
+                        latched = True
+                    elif latched:
+                        g_cmd = schema.GRIPPER_CLOSE  # hold what we grabbed
                 if g_cmd != gripper and g_cmd == schema.GRIPPER_CLOSE and reached_leaf is None:
                     # record which box we are committing to at first close
                     pos_b, _ = runtime.get_ee_pose_b(h, controller)
