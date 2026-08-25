@@ -406,3 +406,16 @@ class DiffIKDriver:
 
 def make_diffik_driver(h: SimHandles, controller, ee_link: str = "j2n6s300_end_effector") -> DiffIKDriver:
     return DiffIKDriver(h, controller, ee_link)
+
+
+def world_to_base_pos(h: SimHandles, pos_w) -> np.ndarray:
+    """World position -> robot base frame, the same transform collect_boxes uses.
+
+    `scene_origins` is the ENV origin, not the robot base, so subtracting it
+    gives a correct xy but a z that is off by the table height -- which is why
+    an early analysis reported box heights of 0.811 m. The robot's root pose is
+    the authority.
+    """
+    root = h.robot.data.root_pose_w
+    base_pos_w = root[0, 0:3].detach().cpu().numpy().astype(np.float64)
+    return np.asarray(pos_w, dtype=np.float64) - base_pos_w

@@ -247,13 +247,15 @@ def _run(args) -> int:
     # the collection expert never rotates during a box reach either.
     # Heights come from the demos rather than from the world->base transform:
     # they close at EE z = 0.047 (1 mm spread) and lift 0.207 m from there.
-    # collect_boxes.py geometry (the path that lifts 12/12):
+    # collect_boxes.py geometry (the path that lifts 12/12), computed from the
+    # ACTUAL box rather than a constant:
     #   grasp_z = box_top + ee_z_offset(0.08) + grasp_depth(-0.07) = box_top + 0.01
-    #   approach from box_top + ee_z_offset + travel_height(0.14) = box_top + 0.22
-    # box_top in the EE frame is the demos' close height, 0.047, so grasp_z is
-    # that value and the approach sits 0.21 m above it.
-    EXPERT_GRASP_Z = 0.047
-    EXPERT_LIFT_Z = EXPERT_GRASP_Z + 0.207
+    #   lift    = box_top + ee_z_offset + travel_height(0.14)      = box_top + 0.22
+    # A hardcoded 0.047 closed ~1.8 cm high, on the box's top edge, and the box
+    # stayed behind while the arm lifted 21 cm.
+    EXPERT_EE_Z_OFFSET = 0.08
+    EXPERT_GRASP_DEPTH = -0.07
+    EXPERT_TRAVEL_H = 0.14
     EXPERT_STEP_M = 0.03      # demos travel ~0.030 m per 5 Hz tick
     EXPERT_TOL_ALIGN_M = 0.012
     # The descend tolerance must be tight: it is applied to the 3-D error, so a
@@ -262,7 +264,7 @@ def _run(args) -> int:
     EXPERT_TOL_DESCEND_M = 0.004
     # Demos wait 4-5 ticks between closing and lifting (156 wait 4, 264 wait 5);
     # the fingers need that long to reach the 1.2 rad closed target.
-    EXPERT_CLOSE_HOLD = 6
+    EXPERT_CLOSE_HOLD = 8   # collection settles 0.3 s then closes over 0.6 s
 
     def orientation_correction(quat_now_np, quat_ref_np):
         """Rotvec that pulls roll/pitch back to the reference, leaving yaw alone.
@@ -280,10 +282,12 @@ def _run(args) -> int:
     def expert_action(pos_b, box_xy, phase, hold):
         """Return (dpos, gripper, phase, hold) for one policy tick."""
         home_z = float(home_pose_z)
+        grasp_z = box_top_z + EXPERT_EE_Z_OFFSET + EXPERT_GRASP_DEPTH
+        lift_z = box_top_z + EXPERT_EE_Z_OFFSET + EXPERT_TRAVEL_H
         targets = {
-            0: np.array([box_xy[0], box_xy[1], home_z], dtype=np.float64),        # align xy high
-            1: np.array([box_xy[0], box_xy[1], EXPERT_GRASP_Z], dtype=np.float64),  # descend
-            2: np.array([box_xy[0], box_xy[1], EXPERT_LIFT_Z], dtype=np.float64),   # lift
+            0: np.array([box_xy[0], box_xy[1], home_z], dtype=np.float64),   # align xy high
+            1: np.array([box_xy[0], box_xy[1], grasp_z], dtype=np.float64),  # descend
+            2: np.array([box_xy[0], box_xy[1], lift_z], dtype=np.float64),   # lift
         }
         if phase == "grip":  # sit still while the fingers close
             hold += 1
@@ -306,6 +310,7 @@ def _run(args) -> int:
         return step, grip, phase, hold
 
     home_pose_z = 0.248  # replaced with the measured home pose below
+    box_top_z = 0.036   # replaced per episode from the actual box
 
     results = []
     for ep in range(args.episodes):
@@ -363,6 +368,10 @@ def _run(args) -> int:
             commanded_leaf = leaves[ep % len(leaves)]
             origin0 = np.asarray(h.scene_origins[0], dtype=np.float32)
             box_xy_b = (layout_w[commanded_leaf] - origin0)[0:2].astype(np.float32)
+            # box top in the BASE frame, via the robot root pose (scene_origins
+            # carries the env origin, whose z is not the table height)
+            box_b = runtime.world_to_base_pos(h, layout_w[commanded_leaf])
+            box_top_z = float(box_b[2]) + 0.5 * float(args.box_size)
             expert_phase, expert_hold = "align", 0
             home_pose_z = float(runtime.get_ee_pose_b(h, controller)[0][2])
         if args.steer_to_box or getattr(cfg, "goal_dim", 0) > 0:
