@@ -336,6 +336,7 @@ def _run(args) -> int:
         # not of which box the arm actually travelled to. This one is timing-free.
         closest = {k: float("inf") for k in boxes_xy_b}
         max_lift_seen = 0.0
+        max_finger_rad = 0.0  # how far the fingers actually close (target 1.2)
         latched = False
         commit_xy = None  # E1 mode-lock: xy endpoint committed at the first replan
         commanded_leaf = None
@@ -471,6 +472,11 @@ def _run(args) -> int:
 
                 snap = runtime.box_snapshot(h)
                 lifts = {k: float(snap[k][2] - boxes0[k][2]) for k in snap if k in boxes0}
+                gj = getattr(controller.gripper, "_base_joint_ids", None)
+                if gj:
+                    max_finger_rad = max(
+                        max_finger_rad, float(h.robot.data.joint_pos[0, gj].max())
+                    )
                 if lifts:
                     # how far the box ACTUALLY moved, whether or not it cleared
                     # the threshold: 0 means the fingers never gripped it, a
@@ -489,9 +495,10 @@ def _run(args) -> int:
         results.append({"episode": ep, "success": success, "reached": reached_leaf, "label": label,
                         "commanded": commanded_leaf, "approached": approached,
                         "max_lift_m": round(float(max_lift_seen), 4),
+                        "max_finger_rad": round(float(max_finger_rad), 4),
                         "closest": {k: round(v, 4) for k, v in closest.items()}})
         cmd_str = f" commanded={commanded_leaf}" if commanded_leaf else ""
-        print(f"[ep {ep:03d}] success={success} reached={reached_leaf} ({label}){cmd_str} lift={max_lift_seen:.3f} steps={step}")
+        print(f"[ep {ep:03d}] success={success} reached={reached_leaf} ({label}){cmd_str} lift={max_lift_seen:.3f} fingers={max_finger_rad:.2f} steps={step}")
 
         np.savez_compressed(
             out_dir / f"episode_{ep:04d}.npz",
@@ -540,6 +547,8 @@ def _run(args) -> int:
         # (0.000) from "gripped then slipped" (small positive)
         "max_lift_m_median": float(np.median([r["max_lift_m"] for r in results])),
         "max_lift_m_best": float(max(r["max_lift_m"] for r in results)),
+        # finger closure actually achieved; the closed target is 1.2 rad
+        "max_finger_rad_median": float(np.median([r["max_finger_rad"] for r in results])),
         "median_closest_approach_m": float(
             np.median([min(r["closest"].values()) for r in results if r["closest"]])
         ),
