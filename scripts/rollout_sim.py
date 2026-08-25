@@ -76,6 +76,17 @@ def main() -> int:
         "they have drifted ~16 cm away. 0 = off.",
     )
     parser.add_argument(
+        "--expert",
+        action="store_true",
+        help="STAGE 0: drive the arm with the scripted expert instead of the policy, through the "
+        "SAME twist controller, success test and summary. The success detector has never fired in "
+        "~200 policy episodes; the demos were collected in kinova-isaac's env while rollouts run in "
+        "lsteer.isaac.runtime, so this checks whether this harness can register a lift at all before "
+        "any conclusion is drawn from a zero. Waypoints mirror the collection expert "
+        "(align xy at home height -> descend -> lift); --ckpt is still required for the env config "
+        "but the network is never queried.",
+    )
+    parser.add_argument(
         "--clamp-height",
         type=float,
         default=0.0,
@@ -204,6 +215,49 @@ def _run(args) -> int:
         state = build_lowdim_obs(pos_b, quat_b, gripper_state)
         return imgs, torch.from_numpy(state), pos_b
 
+    # ---- STAGE 0: scripted expert -----------------------------------------
+    # Mirrors the collection expert (ScriptedPlanner + WaypointFollowerInput):
+    # three position waypoints executed closed-loop off the CURRENT pose, with
+    # zero rotation. Rotation really is unnecessary here -- across all 420 demos
+    # the home orientation and the grasp orientation are the same to 1e-4, so
+    # the collection expert never rotates during a box reach either.
+    # Heights come from the demos rather than from the world->base transform:
+    # they close at EE z = 0.047 (1 mm spread) and lift 0.207 m from there.
+    EXPERT_GRASP_Z = 0.047
+    EXPERT_LIFT_Z = EXPERT_GRASP_Z + 0.207
+    EXPERT_STEP_M = 0.03      # demos travel ~0.030 m per 5 Hz tick
+    EXPERT_TOL_M = 0.012
+    EXPERT_CLOSE_HOLD = 3     # ticks held closed before lifting
+
+    def expert_action(pos_b, box_xy, phase, hold):
+        """Return (dpos, gripper, phase, hold) for one policy tick."""
+        home_z = float(home_pose_z)
+        targets = {
+            0: np.array([box_xy[0], box_xy[1], home_z], dtype=np.float64),        # align xy high
+            1: np.array([box_xy[0], box_xy[1], EXPERT_GRASP_Z], dtype=np.float64),  # descend
+            2: np.array([box_xy[0], box_xy[1], EXPERT_LIFT_Z], dtype=np.float64),   # lift
+        }
+        if phase == "grip":  # sit still while the fingers close
+            hold += 1
+            return np.zeros(3), schema.GRIPPER_CLOSE, ("lift" if hold >= EXPERT_CLOSE_HOLD else "grip"), hold
+        if phase == "done":  # hold the lifted pose so the success test can settle
+            return np.zeros(3), schema.GRIPPER_CLOSE, "done", hold
+        idx = {"align": 0, "descend": 1, "lift": 2}[phase]
+        tgt = targets[idx]
+        err = tgt - np.asarray(pos_b, dtype=np.float64)
+        if float(np.linalg.norm(err)) < EXPERT_TOL_M:
+            if phase == "align":
+                return np.zeros(3), schema.GRIPPER_OPEN, "descend", hold
+            if phase == "descend":
+                return np.zeros(3), schema.GRIPPER_CLOSE, "grip", hold
+            return np.zeros(3), schema.GRIPPER_CLOSE, "done", hold
+        n = float(np.linalg.norm(err))
+        step = err * min(1.0, EXPERT_STEP_M / max(n, 1e-9))
+        grip = schema.GRIPPER_OPEN if phase in ("align", "descend") else schema.GRIPPER_CLOSE
+        return step, grip, phase, hold
+
+    home_pose_z = 0.248  # replaced with the measured home pose below
+
     results = []
     for ep in range(args.episodes):
         # reset robot + teleport boxes back to the fixed layout.
@@ -251,6 +305,13 @@ def _run(args) -> int:
         commit_xy = None  # E1 mode-lock: xy endpoint committed at the first replan
         commanded_leaf = None
         goal_vec = None
+        if args.expert:
+            leaves = sorted(layout_w.keys())
+            commanded_leaf = leaves[ep % len(leaves)]
+            origin0 = np.asarray(h.scene_origins[0], dtype=np.float32)
+            box_xy_b = (layout_w[commanded_leaf] - origin0)[0:2].astype(np.float32)
+            expert_phase, expert_hold = "align", 0
+            home_pose_z = float(runtime.get_ee_pose_b(h, controller)[0][2])
         if args.steer_to_box or getattr(cfg, "goal_dim", 0) > 0:
             leaves = sorted(layout_w.keys())
             commanded_leaf = leaves[ep % len(leaves)]
@@ -280,7 +341,26 @@ def _run(args) -> int:
             if goal_vec is not None:
                 obs["goal"] = goal_vec
             cur_xy = obs["state"][-1, 0:2].numpy()
-            if args.mode_lock > 0 and commit_xy is not None:
+            if args.expert:
+                # one expert tick per policy tick, same cadence as act_horizon
+                pos_now, _ = runtime.get_ee_pose_b(h, controller)
+                dpos, g_exp, expert_phase, expert_hold = expert_action(
+                    pos_now, box_xy_b, expert_phase, expert_hold
+                )
+                actions = np.zeros((1, 7), dtype=np.float32)
+                actions[0, 0:3] = dpos
+                actions[0, 6] = g_exp
+                replans.append(
+                    {
+                        "step": step,
+                        "state": obs["state"].numpy(),
+                        "z": np.zeros((cfg.pred_horizon, cfg.action_dim), dtype=np.float32),
+                        "action_pred": np.repeat(actions, cfg.pred_horizon, axis=0),
+                        "mode_lock_sel": np.int64(0),
+                        "commit_xy": box_xy_b.astype(np.float32),
+                    }
+                )
+            elif args.mode_lock > 0 and commit_xy is not None:
                 # sample K fresh candidates and stay loyal to the commitment
                 out = policy.predict_action(obs, k=args.mode_lock, generator=g_ep)
                 preds = out["action_pred"].cpu().numpy()  # (K, T_p, 7)
@@ -292,17 +372,18 @@ def _run(args) -> int:
                 if args.mode_lock > 0:
                     pred0 = out["action_pred"][0].cpu().numpy()
                     commit_xy = cur_xy + pred0[:, 0:2].sum(axis=0)
-            actions = out["action"][sel].cpu().numpy()  # (T_a, 7)
-            replans.append(
-                {
-                    "step": step,
-                    "state": obs["state"].numpy(),
-                    "z": out["z"][sel].cpu().numpy(),
-                    "action_pred": out["action_pred"][sel].cpu().numpy(),
-                    "mode_lock_sel": np.int64(sel),
-                    "commit_xy": (np.zeros(2, dtype=np.float32) if commit_xy is None else commit_xy.astype(np.float32)),
-                }
-            )
+            if not args.expert:
+                actions = out["action"][sel].cpu().numpy()  # (T_a, 7)
+                replans.append(
+                    {
+                        "step": step,
+                        "state": obs["state"].numpy(),
+                        "z": out["z"][sel].cpu().numpy(),
+                        "action_pred": out["action_pred"][sel].cpu().numpy(),
+                        "mode_lock_sel": np.int64(sel),
+                        "commit_xy": (np.zeros(2, dtype=np.float32) if commit_xy is None else commit_xy.astype(np.float32)),
+                    }
+                )
 
             for a in actions:
                 if args.clamp_height > 0.0:
