@@ -64,6 +64,18 @@ def main() -> int:
         "--steer-to-box).",
     )
     parser.add_argument(
+        "--close-max-height",
+        type=float,
+        default=0.0,
+        metavar="Z_M",
+        help="E3b: also require the EE to be at or below this height (base frame, "
+        "table ~0, box top ~0.05) before the gripper may close. Without it the arm "
+        "closes ~25 cm above the box while horizontally on target, and because the "
+        "gripper state is part of the observation that early close derails the rest "
+        "of the episode: 38/40 rollouts only descend AFTER closing, by which point "
+        "they have drifted ~16 cm away. 0 = off.",
+    )
+    parser.add_argument(
         "--steer-to-box",
         action="store_true",
         help="E1b: instead of committing to the policy's own first endpoint, "
@@ -272,14 +284,19 @@ def _run(args) -> int:
 
             for a in actions:
                 g_cmd = schema.GRIPPER_OPEN if a[6] > 0.0 else schema.GRIPPER_CLOSE
-                if (
-                    args.close_on_arrival > 0.0
-                    and commanded_leaf is not None
-                    and g_cmd == schema.GRIPPER_CLOSE
+                if g_cmd == schema.GRIPPER_CLOSE and (
+                    (args.close_on_arrival > 0.0 and commanded_leaf is not None)
+                    or args.close_max_height > 0.0
                 ):
                     pos_now, _ = runtime.get_ee_pose_b(h, controller)
-                    if float(np.linalg.norm(pos_now[0:2] - box_xy_b)) > args.close_on_arrival:
-                        g_cmd = schema.GRIPPER_OPEN  # not there yet
+                    too_far = (
+                        args.close_on_arrival > 0.0
+                        and commanded_leaf is not None
+                        and float(np.linalg.norm(pos_now[0:2] - box_xy_b)) > args.close_on_arrival
+                    )
+                    too_high = args.close_max_height > 0.0 and float(pos_now[2]) > args.close_max_height
+                    if too_far or too_high:
+                        g_cmd = schema.GRIPPER_OPEN  # not on the box yet
                 if g_cmd != gripper and g_cmd == schema.GRIPPER_CLOSE and reached_leaf is None:
                     # record which box we are committing to at first close
                     pos_b, _ = runtime.get_ee_pose_b(h, controller)
