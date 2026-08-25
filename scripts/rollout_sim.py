@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 from collections import deque
 from pathlib import Path
@@ -156,6 +157,15 @@ def main() -> int:
     code = 1
     try:
         code = _run(args)
+    except BaseException:
+        # os._exit below bypasses normal exception handling, so a crash would
+        # otherwise exit(1) with an EMPTY log and no traceback at all.
+        import traceback
+
+        traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        code = 1
     finally:
         # Kit sometimes wedges in close() headless; give it 60 s then force-exit
         # with the outcome code (all results were already printed/written).
