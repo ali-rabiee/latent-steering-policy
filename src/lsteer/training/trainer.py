@@ -16,7 +16,8 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from lsteer.data.dataset import ZarrChunkDataset, split_episodes
+from lsteer.data import schema
+from lsteer.data.dataset import ZarrChunkDataset, layout_group_ids, split_episodes
 from lsteer.models.ema import EMAModel
 from lsteer.policy import DiffusionPolicy, PolicyConfig
 from lsteer.training.config import TrainConfig
@@ -59,14 +60,34 @@ class Trainer:
         # data --------------------------------------------------------------
         import zarr
 
-        n_episodes = len(zarr.open(cfg.data.zarr_path, mode="r")["meta/episode_ends"])
-        self.train_eps, self.val_eps = split_episodes(n_episodes, cfg.data.val_fraction, cfg.data.split_seed)
+        root = zarr.open(cfg.data.zarr_path, mode="r")
+        n_episodes = len(root["meta/episode_ends"])
+
+        # Split by LAYOUT, not by episode. Episodes come in round-robin cycles
+        # sharing one layout; splitting randomly puts a layout's twins on both
+        # sides and validation then measures recall, not generalisation.
+        group_ids = None
+        if cfg.data.split_by_layout and schema.META_BOX_POSITIONS in root:
+            group_ids = layout_group_ids(np.asarray(root[schema.META_BOX_POSITIONS]))
+        self.train_eps, self.val_eps = split_episodes(
+            n_episodes, cfg.data.val_fraction, cfg.data.split_seed, group_ids=group_ids
+        )
+        if group_ids is not None:
+            tr_g, va_g = set(group_ids[self.train_eps]), set(group_ids[self.val_eps])
+            leaked = tr_g & va_g
+            print(
+                f"split: {len(np.unique(group_ids))} layouts -> "
+                f"{len(self.train_eps)} train / {len(self.val_eps)} val episodes "
+                f"({len(tr_g)}/{len(va_g)} layouts), leaked layouts: {len(leaked)}"
+            )
+            assert not leaked, f"{len(leaked)} layouts appear in BOTH splits"
         common = dict(
             obs_horizon=cfg.data.obs_horizon,
             pred_horizon=cfg.data.pred_horizon,
             act_horizon=cfg.data.act_horizon,
             crop_size=cfg.data.crop,
             camera_names=tuple(cfg.data.camera_names) or None,
+            goal_conditioned=cfg.data.goal_conditioned,
         )
         self.train_set = ZarrChunkDataset(cfg.data.zarr_path, episode_ids=self.train_eps, train=True, **common)
         self.val_set = (
@@ -104,6 +125,7 @@ class Trainer:
             num_train_timesteps=cfg.diffusion.train_steps,
             num_inference_steps=cfg.diffusion.infer_steps,
             clip_sample=cfg.diffusion.clip_sample,
+            goal_dim=schema.GOAL_DIM if cfg.data.goal_conditioned else 0,
         )
         self.policy = DiffusionPolicy(policy_cfg).to(cfg.device)
         self.policy.schedule.to(cfg.device)
@@ -113,6 +135,7 @@ class Trainer:
         self.optimizer = torch.optim.AdamW(
             self.policy.parameters(), lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay
         )
+        self.best_val = float("inf")
         self.log_fn = _make_logger(cfg, self.out_dir)
         self.git_sha = _git_sha(Path(__file__).resolve().parents[3])
 
@@ -127,7 +150,15 @@ class Trainer:
         self.policy.save(
             self.out_dir / name,
             extra={
+                # "ema" stays a plain model state_dict — DiffusionPolicy.load reads it
                 "ema": self.ema.averaged_model.state_dict(),
+                # State needed to CONTINUE training after preemption. AdamW's
+                # state is ~2x the model, doubling a checkpoint from 710 MB to
+                # 1.4 GB, and only latest.ckpt is ever resumed from -- so the
+                # periodic step_*.ckpt archives skip it.
+                "ema_optimization_step": self.ema.optimization_step,
+                "best_val": self.best_val,
+                **({"optimizer": self.optimizer.state_dict()} if name == "latest.ckpt" else {}),
                 "step": step,
                 "train_config": self.cfg.to_dict(),
                 "git_sha": self.git_sha,
@@ -173,11 +204,35 @@ class Trainer:
             "val/action_grip_mse": float(np.mean(grip_err)),
         }
 
+    def _maybe_resume(self) -> int:
+        """Continue from `latest.ckpt` in this run's out_dir, if present.
+
+        Without this a preempted job restarts from step 0, which makes the
+        *-preempt partitions unusable for multi-hour training -- and on a
+        contended cluster those are often the only ones with free GPUs.
+        Requires Slurm `--requeue` so the job comes back at all.
+        """
+        path = self.out_dir / "latest.ckpt"
+        if not (self.cfg.resume and path.exists()):
+            return 0
+        ck = torch.load(path, map_location=self.cfg.device, weights_only=False)
+        self.policy.load_state_dict(ck["model"])
+        self.policy.normalizer.load_state_dict(ck["normalizer"])
+        self.ema.averaged_model.load_state_dict(ck["ema"])
+        self.ema.optimization_step = int(ck.get("ema_optimization_step", ck["step"]))
+        if "optimizer" in ck:
+            self.optimizer.load_state_dict(ck["optimizer"])
+        self.best_val = float(ck.get("best_val", float("inf")))
+        step = int(ck["step"])
+        print(f"RESUMED from {path} at step {step}/{self.cfg.optim.num_steps}", flush=True)
+        return step
+
     def fit(self) -> Path:
         cfg = self.cfg
         device = cfg.device
-        step = 0
-        best_val = float("inf")
+        step = self._maybe_resume()
+        start_step = step
+        best_val = self.best_val
         self.policy.train()
         data_iter = iter(self.train_loader)
         t0 = time.time()
@@ -202,7 +257,7 @@ class Trainer:
             step += 1
 
             if step % cfg.log.log_every == 0:
-                sps = step / (time.time() - t0)
+                sps = (step - start_step) / (time.time() - t0)
                 self.log_fn(step, {"train/loss": float(loss), "train/lr": lr, "train/steps_per_s": sps})
                 print(f"step {step:>7d}  loss {float(loss):.5f}  lr {lr:.2e}  {sps:.1f} it/s")
 
@@ -214,7 +269,7 @@ class Trainer:
                 print("  " + "  ".join(f"{k}={v:.5f}" for k, v in metrics.items()))
                 val_key = metrics.get("val/action_pos_mse", float("inf"))
                 if val_key < best_val:
-                    best_val = val_key
+                    best_val = self.best_val = val_key
                     self._save(step, "best_val.ckpt")
 
             if step % cfg.log.ckpt_every == 0:

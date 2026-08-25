@@ -119,3 +119,35 @@ def test_boxes_logs_parse_with_both_cameras():
 def test_missing_camera_dir_skips_episode():
     ep = discover_episodes(BOX_LOGS)[0]
     assert parse_episode(ep, require_success=False, camera_names=("front", "nope")) is None
+
+
+# --------------------------------------------------------------- layout split
+def test_layout_grouping_and_split_have_no_leakage():
+    """Episodes sharing a layout must land on the SAME side of the split.
+
+    Mirrors the collector: cycles of 4 episodes share a layout (jittered by
+    physics settling) with round-robin targets, then the boxes respawn.
+    """
+    from lsteer.data.dataset import layout_group_ids, split_episodes
+
+    rng = np.random.default_rng(0)
+    n_cycles, per_cycle = 30, 4
+    rows = []
+    for _ in range(n_cycles):
+        base = rng.uniform([0.30, -0.30], [0.55, 0.30], size=(4, 2))
+        for _ in range(per_cycle):                      # same layout + mm jitter
+            jit = base + rng.normal(0, 0.0015, size=base.shape)
+            rows.append(np.c_[jit, np.full(4, 0.011)])
+    box_pos = np.stack(rows)
+
+    gid = layout_group_ids(box_pos)
+    assert len(np.unique(gid)) == n_cycles, f"expected {n_cycles} layouts, got {len(np.unique(gid))}"
+
+    train, val = split_episodes(len(box_pos), val_fraction=0.2, seed=1, group_ids=gid)
+    assert len(train) + len(val) == len(box_pos)
+    assert not (set(gid[train]) & set(gid[val])), "a layout appears in BOTH splits"
+    assert len(val) > 0
+
+    # the old behaviour is what leaked: keep it reachable but prove it differs
+    tr2, va2 = split_episodes(len(box_pos), val_fraction=0.2, seed=1)
+    assert set(gid[tr2]) & set(gid[va2]), "episode-wise split should leak (that was the bug)"

@@ -82,6 +82,7 @@ class ZarrChunkDataset(Dataset):
         crop_size: int = schema.IMG_CROP_SIZE,
         train: bool = True,
         camera_names=None,
+        goal_conditioned: bool = False,
     ):
         import zarr
 
@@ -116,6 +117,20 @@ class ZarrChunkDataset(Dataset):
                 "Single-camera zarrs from before M3.6 must be re-converted."
             )
         self.img = {c: self.root[schema.camera_img_key(c)] for c in self.camera_names}
+
+        # E2: per-episode goal vector = target colour one-hot + target xy (base).
+        # The collector recorded round-robin targets, so this is ground truth,
+        # not a reconstruction from the gripper signal.
+        self.goal_conditioned = goal_conditioned
+        if goal_conditioned:
+            colors = np.asarray(self.root[schema.META_TARGET_COLOR], dtype=np.int64)
+            pos = np.asarray(self.root[schema.META_TARGET_POS], dtype=np.float32)
+            if colors.min() < 0 or colors.max() >= schema.MAX_BOXES:
+                raise ValueError(f"target colors outside [0,{schema.MAX_BOXES}): {np.unique(colors)}")
+            goals = np.zeros((n_episodes, schema.GOAL_DIM), dtype=np.float32)
+            goals[np.arange(n_episodes), colors] = 1.0
+            goals[:, schema.MAX_BOXES:] = pos[:, 0:2]
+            self.goal_vecs = goals
 
         self.indices = create_sample_indices(
             self.episode_ends,
@@ -158,6 +173,11 @@ class ZarrChunkDataset(Dataset):
             "state": torch.from_numpy(np.ascontiguousarray(state)),
             "action": torch.from_numpy(np.ascontiguousarray(action)),
         }
+        if self.goal_conditioned:
+            # buffer_start is always inside the source episode (padding only
+            # repeats frames, it never crosses an episode boundary)
+            ep = int(np.searchsorted(self.episode_ends, buffer_start, side="right"))
+            out["goal"] = torch.from_numpy(self.goal_vecs[ep])
         for cam, arr in self.img.items():
             img = torch.stack([image_to_tensor(arr[i]) for i in buf_indices])  # (T_o,3,H,W)
             h, w_ = img.shape[-2], img.shape[-1]
@@ -169,8 +189,79 @@ class ZarrChunkDataset(Dataset):
         return out
 
 
-def split_episodes(n_episodes: int, val_fraction: float = 0.1, seed: int = 42) -> tuple[np.ndarray, np.ndarray]:
+def layout_group_ids(box_positions: np.ndarray, tol: float = 0.02) -> np.ndarray:
+    """Group episodes that share a box layout.
+
+    The collector records demos in cycles: the SAME layout is used for one
+    episode per box (round-robin targets) before the boxes are respawned. That
+    grouping is the multimodal pairing the policy is supposed to learn — and it
+    is exactly why episodes must not be split randomly. Layouts within a cycle
+    differ only by physics settling (~1-3 mm), while different cycles differ by
+    >=10 cm, so a 2 cm tolerance separates them cleanly.
+
+    box_positions: (n_episodes, MAX_BOXES, 3), NaN-padded. Returns (n_episodes,)
+    integer group ids.
+    """
+    pts = []
+    for row in box_positions:
+        v = np.asarray(row, dtype=np.float64)
+        pts.append(v[~np.isnan(v[:, 0])][:, :2])
+
+    def same_layout(a: np.ndarray, b: np.ndarray) -> bool:
+        # Greedy nearest-neighbour matching, NOT a sorted-key compare: settling
+        # jitter can reorder two boxes with similar x, which would make an
+        # order-dependent key spuriously distinct.
+        if a.shape != b.shape:
+            return False
+        if a.size == 0:
+            return True
+        used = np.zeros(len(b), dtype=bool)
+        for p in a:
+            d = np.linalg.norm(b - p, axis=1)
+            d[used] = np.inf
+            j = int(d.argmin())
+            if d[j] >= tol:
+                return False
+            used[j] = True
+        return True
+
+    gid = np.full(len(pts), -1, dtype=np.int64)
+    nxt = 0
+    for i in range(len(pts)):
+        if gid[i] >= 0:
+            continue
+        gid[i] = nxt
+        for j in range(i + 1, len(pts)):
+            if gid[j] < 0 and same_layout(pts[i], pts[j]):
+                gid[j] = nxt
+        nxt += 1
+    return gid
+
+
+def split_episodes(
+    n_episodes: int,
+    val_fraction: float = 0.1,
+    seed: int = 42,
+    group_ids: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Train/val episode split.
+
+    `group_ids` (from `layout_group_ids`) splits by LAYOUT rather than by
+    episode. Without it, the four episodes sharing a layout get scattered across
+    both splits: measured on boxes_v0, 88% of val episodes had a layout twin in
+    train, so val error measured recall on memorised layouts instead of
+    generalisation — and the reported 4.5 mm was not evidence the policy works.
+    """
     rng = np.random.default_rng(seed)
-    perm = rng.permutation(n_episodes)
-    n_val = max(1, int(round(n_episodes * val_fraction))) if n_episodes > 1 else 0
-    return np.sort(perm[n_val:]), np.sort(perm[:n_val])
+    if group_ids is None:
+        perm = rng.permutation(n_episodes)
+        n_val = max(1, int(round(n_episodes * val_fraction))) if n_episodes > 1 else 0
+        return np.sort(perm[n_val:]), np.sort(perm[:n_val])
+
+    group_ids = np.asarray(group_ids)
+    groups = np.unique(group_ids)
+    gperm = rng.permutation(len(groups))
+    n_val_g = max(1, int(round(len(groups) * val_fraction))) if len(groups) > 1 else 0
+    val_groups = set(groups[gperm[:n_val_g]].tolist())
+    is_val = np.array([g in val_groups for g in group_ids])
+    return np.flatnonzero(~is_val), np.flatnonzero(is_val)

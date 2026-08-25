@@ -21,6 +21,10 @@ STATE_DIM = 10
 ACTION_DIM = 7
 FPS = 5.0
 
+# E2 goal conditioning: target box colour one-hot over MAX_BOXES palette slots
+# (ids 0..3 in boxes_v0) + target xy in base frame, from meta/episode_target_*.
+GOAL_DIM = 6
+
 IMG_STORE_SIZE = 256  # stored in zarr (resized from 640 with area interpolation)
 IMG_CROP_SIZE = 224   # network input (random crop train / center crop eval)
 

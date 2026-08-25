@@ -39,6 +39,9 @@ class PolicyConfig:
     num_train_timesteps: int = 100
     num_inference_steps: int = 16
     clip_sample: bool = True
+    # E2: >0 appends a goal vector (target colour one-hot + xy) to the global
+    # conditioning. 0 keeps the original unconditioned architecture.
+    goal_dim: int = 0
 
 
 class DiffusionPolicy(nn.Module):
@@ -54,7 +57,7 @@ class DiffusionPolicy(nn.Module):
         )
         self.unet = ConditionalUnet1D(
             input_dim=cfg.action_dim,
-            global_cond_dim=self.obs_encoder.out_dim,
+            global_cond_dim=self.obs_encoder.out_dim + cfg.goal_dim,
             diffusion_step_embed_dim=cfg.diffusion_step_embed_dim,
             down_dims=tuple(cfg.down_dims),
             kernel_size=cfg.kernel_size,
@@ -66,10 +69,19 @@ class DiffusionPolicy(nn.Module):
 
     # ------------------------------------------------------------ obs plumbing
     def _encode_obs(self, obs: dict[str, torch.Tensor], state_n: torch.Tensor) -> torch.Tensor:
-        """Build the encoder input from the img_<cam> entries + normalized state."""
+        """Build the encoder input from the img_<cam> entries + normalized state
+        (+ the goal vector, appended raw, when the policy is goal-conditioned)."""
         enc_in = {schema.camera_obs_key(c): obs[schema.camera_obs_key(c)] for c in self.cfg.camera_names}
         enc_in["state"] = state_n
-        return self.obs_encoder(enc_in)
+        cond = self.obs_encoder(enc_in)
+        if self.cfg.goal_dim > 0:
+            if "goal" not in obs:
+                raise KeyError("policy is goal-conditioned (goal_dim>0) but obs has no 'goal'")
+            goal = obs["goal"]
+            if goal.dim() == 1:
+                goal = goal.unsqueeze(0)
+            cond = torch.cat([cond, goal.to(cond.dtype)], dim=-1)
+        return cond
 
     # ---------------------------------------------------------------- train
     def compute_loss(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -124,6 +136,8 @@ class DiffusionPolicy(nn.Module):
         state = obs["state"].to(device)
         if state.dim() == 2:
             state = state.unsqueeze(0)
+        if self.cfg.goal_dim > 0 and "goal" in obs:
+            imgs["goal"] = obs["goal"].to(device)
 
         state_n = self.normalizer.normalize("state", state)
         cond = self._encode_obs(imgs, state_n)  # (1, C)

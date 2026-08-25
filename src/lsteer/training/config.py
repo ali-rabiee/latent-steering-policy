@@ -21,6 +21,8 @@ class DataConfig:
     # cameras to train on; must all exist in the zarr. Empty = use whatever the
     # zarr was converted with (recorded in its attrs).
     camera_names: list[str] = field(default_factory=lambda: list(SCHEMA_CAMERA_NAMES))
+    # split train/val by box LAYOUT, not by episode (see dataset.split_episodes)
+    split_by_layout: bool = True
     obs_horizon: int = 2
     pred_horizon: int = 8
     act_horizon: int = 4
@@ -28,6 +30,8 @@ class DataConfig:
     val_fraction: float = 0.1
     split_seed: int = 42
     num_workers: int = 4
+    # E2: condition on the recorded per-episode target (colour one-hot + xy)
+    goal_conditioned: bool = False
 
 
 @dataclass
@@ -75,6 +79,9 @@ class TrainConfig:
     diffusion: DiffusionConfig = field(default_factory=DiffusionConfig)
     optim: OptimConfig = field(default_factory=OptimConfig)
     log: LogConfig = field(default_factory=LogConfig)
+    # auto-continue from latest.ckpt in the run dir (needed for --requeue
+    # on preempt partitions; harmless otherwise)
+    resume: bool = True
     seed: int = 0
     device: str = "cuda"
 

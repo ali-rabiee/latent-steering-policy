@@ -44,6 +44,23 @@ def main() -> int:
     parser.add_argument("--lift-thresh", type=float, default=0.06)
     parser.add_argument("--out-dir", type=Path, default=None)
     parser.add_argument(
+        "--mode-lock",
+        type=int,
+        default=0,
+        metavar="K",
+        help="E1: commit to the first replan's predicted endpoint; on every later "
+        "replan sample K candidate chunks and execute the one whose endpoint is "
+        "closest (xy) to the commitment. 0 = off (one fresh sample per replan).",
+    )
+    parser.add_argument(
+        "--steer-to-box",
+        action="store_true",
+        help="E1b: instead of committing to the policy's own first endpoint, "
+        "command the target box round-robin over episodes and lock to ITS xy "
+        "(requires --mode-lock K for the candidate count). Measures the upper "
+        "bound of inference-time steering; summary gains a per_command block.",
+    )
+    parser.add_argument(
         "--save-frames",
         action="store_true",
         help="dump per-camera PNGs per policy step into <out>/episode_XXXX/images/<cam>/, "
@@ -179,6 +196,27 @@ def _run(args) -> int:
         reached_leaf = None
         success = False
         boxes0 = runtime.box_snapshot(h)
+        commit_xy = None  # E1 mode-lock: xy endpoint committed at the first replan
+        commanded_leaf = None
+        goal_vec = None
+        if args.steer_to_box or getattr(cfg, "goal_dim", 0) > 0:
+            leaves = sorted(layout_w.keys())
+            commanded_leaf = leaves[ep % len(leaves)]
+            origin0 = np.asarray(h.scene_origins[0], dtype=np.float32)
+            box_xy_b = (layout_w[commanded_leaf] - origin0)[0:2].astype(np.float32)
+        if args.steer_to_box:
+            if args.mode_lock <= 0:
+                raise SystemExit("--steer-to-box requires --mode-lock K")
+            commit_xy = box_xy_b
+        if getattr(cfg, "goal_dim", 0) > 0:
+            # E2 goal-conditioned ckpt: command the box explicitly, same
+            # round-robin protocol as --steer-to-box
+            label = h.id_to_label.get(commanded_leaf, "")
+            color_idx = schema.COLOR_PALETTE.index(label.split()[0])
+            gv = np.zeros(cfg.goal_dim, dtype=np.float32)
+            gv[color_idx] = 1.0
+            gv[schema.MAX_BOXES : schema.MAX_BOXES + 2] = box_xy_b
+            goal_vec = torch.from_numpy(gv)
 
         step = 0
         while step < steps_per_episode:
@@ -187,14 +225,30 @@ def _run(args) -> int:
                 for cam in cfg.camera_names
             }
             obs["state"] = torch.stack([s for _, s in obs_hist])
-            out = policy.predict_action(obs, z=z_ep, k=1)  # z held fixed for the episode
-            actions = out["action"][0].cpu().numpy()  # (T_a, 7)
+            if goal_vec is not None:
+                obs["goal"] = goal_vec
+            cur_xy = obs["state"][-1, 0:2].numpy()
+            if args.mode_lock > 0 and commit_xy is not None:
+                # sample K fresh candidates and stay loyal to the commitment
+                out = policy.predict_action(obs, k=args.mode_lock, generator=g_ep)
+                preds = out["action_pred"].cpu().numpy()  # (K, T_p, 7)
+                ends = cur_xy[None] + preds[:, :, 0:2].sum(axis=1)
+                sel = int(np.argmin(np.linalg.norm(ends - commit_xy[None], axis=1)))
+            else:
+                out = policy.predict_action(obs, z=z_ep, k=1)  # z held fixed for the episode
+                sel = 0
+                if args.mode_lock > 0:
+                    pred0 = out["action_pred"][0].cpu().numpy()
+                    commit_xy = cur_xy + pred0[:, 0:2].sum(axis=0)
+            actions = out["action"][sel].cpu().numpy()  # (T_a, 7)
             replans.append(
                 {
                     "step": step,
                     "state": obs["state"].numpy(),
-                    "z": out["z"][0].cpu().numpy(),
-                    "action_pred": out["action_pred"][0].cpu().numpy(),
+                    "z": out["z"][sel].cpu().numpy(),
+                    "action_pred": out["action_pred"][sel].cpu().numpy(),
+                    "mode_lock_sel": np.int64(sel),
+                    "commit_xy": (np.zeros(2, dtype=np.float32) if commit_xy is None else commit_xy.astype(np.float32)),
                 }
             )
 
@@ -229,8 +283,10 @@ def _run(args) -> int:
                 break
 
         label = h.id_to_label.get(reached_leaf or "", "")
-        results.append({"episode": ep, "success": success, "reached": reached_leaf, "label": label})
-        print(f"[ep {ep:03d}] success={success} reached={reached_leaf} ({label}) steps={step}")
+        results.append({"episode": ep, "success": success, "reached": reached_leaf, "label": label,
+                        "commanded": commanded_leaf})
+        cmd_str = f" commanded={commanded_leaf}" if commanded_leaf else ""
+        print(f"[ep {ep:03d}] success={success} reached={reached_leaf} ({label}){cmd_str} steps={step}")
 
         np.savez_compressed(
             out_dir / f"episode_{ep:04d}.npz",
@@ -239,6 +295,9 @@ def _run(args) -> int:
             label=label,
             layout_ids=np.array(sorted(layout_w.keys())),
             layout_pos_w=np.stack([layout_w[k] for k in sorted(layout_w.keys())]),
+            # world->base offset, so offline analysis can assign endpoints to boxes
+            # exactly (E0 had to estimate this to +/-0.15m from behavior)
+            scene_origin=np.asarray(h.scene_origins[0], dtype=np.float32),
             **{
                 f"replan{i:03d}_{key}": val
                 for i, r in enumerate(replans)
@@ -259,6 +318,16 @@ def _run(args) -> int:
         "ckpt": str(args.ckpt),
         "seed": args.seed,
     }
+    if any(r["commanded"] for r in results):
+        per_cmd: dict[str, dict[str, int]] = {}
+        for r in results:
+            c = per_cmd.setdefault(r["commanded"], {"n": 0, "correct": 0})
+            c["n"] += 1
+            c["correct"] += int(r["reached"] == r["commanded"])
+        summary["per_command"] = {
+            k: {"n": v["n"], "correct": v["correct"], "accuracy": v["correct"] / max(1, v["n"])}
+            for k, v in sorted(per_cmd.items())
+        }
     print(json.dumps(summary, indent=2))
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     print(f"rollout data -> {out_dir}")
