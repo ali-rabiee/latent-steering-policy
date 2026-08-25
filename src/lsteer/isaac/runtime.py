@@ -291,10 +291,56 @@ def step_sim(h: SimHandles, controller, *, render: bool) -> None:
             sensor.update(h.dt)
 
 
+_RB_VIEWS: dict[str, object] = {}
+
+
+def _rigid_view(prim_path: str):
+    """Cached PhysX rigid-body view for a spawned box."""
+    from isaacsim.core.simulation_manager import SimulationManager
+
+    if prim_path in _RB_VIEWS:
+        return _RB_VIEWS[prim_path]
+    view = None
+    try:
+        sim_view = SimulationManager.get_physics_sim_view()
+        v = sim_view.create_rigid_body_view(str(prim_path))
+        if v.get_transforms().shape[0] == 0:
+            v = sim_view.create_rigid_body_view(f"{prim_path}/*")
+        view = v if v.get_transforms().shape[0] > 0 else None
+    except Exception:
+        view = None
+    _RB_VIEWS[prim_path] = view
+    return view
+
+
 def box_snapshot(h: SimHandles) -> dict[str, np.ndarray]:
-    """{leaf id: world position (3,)} for all spawned boxes."""
-    out = {}
-    for o in h.tracker.snapshot():
+    """{leaf id: world position (3,)} for all spawned boxes, read from PHYSICS.
+
+    ObjectsTracker.snapshot() prefers PhysX but silently falls back to a USD
+    XformCache read, which -- as its own comment says -- "may not reflect dynamic
+    motion". In this rollout that fallback was being taken, so every box reported
+    its SPAWN pose forever: `lift` and total displacement came back as exactly
+    0.0000 in every episode of every experiment, including ones where the arm
+    demonstrably closed on the box and lifted 21 cm. The success detector was
+    blind, which is why nine experiments in a row scored zero.
+
+    collect_boxes.py reads rb.get_world_poses() for exactly this reason ("unlike
+    the OBB / USD read, this is always current after a set_world_poses
+    teleport"). This does the same through the physics sim view, falling back to
+    the tracker only if no rigid-body view exists.
+    """
+    out: dict[str, np.ndarray] = {}
+    for path in h.spawned_paths:
+        leaf = str(path).split("/")[-1]
+        view = _rigid_view(path)
+        if view is not None:
+            t = view.get_transforms()  # [x, y, z, qx, qy, qz, qw]
+            out[leaf] = np.asarray(
+                [float(t[0][0]), float(t[0][1]), float(t[0][2])], dtype=np.float32
+            )
+    if out:
+        return out
+    for o in h.tracker.snapshot():  # last resort: whatever the tracker can see
         out[o.id] = np.asarray(o.pose.position_m, dtype=np.float32)
     return out
 
