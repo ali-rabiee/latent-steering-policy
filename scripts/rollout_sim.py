@@ -76,6 +76,18 @@ def main() -> int:
         "they have drifted ~16 cm away. 0 = off.",
     )
     parser.add_argument(
+        "--clamp-height",
+        type=float,
+        default=0.0,
+        metavar="Z_MAX",
+        help="E5: refuse to command the EE above Z_MAX (base frame). The demos never "
+        "exceed 0.256 m, yet the closed-loop policy spends 24-37%% of every rollout above "
+        "that, reaching 0.881 m -- it drifts out of the training distribution during the "
+        "reach, before any gripper action, and off-distribution its gripper and descent "
+        "predictions are unreliable. Keeping it inside the demo envelope is the cheapest "
+        "test of whether that drift is what breaks the grasp. 0 = off.",
+    )
+    parser.add_argument(
         "--latch-gripper",
         action="store_true",
         help="E3c: once the gripper has closed (under whatever gates are active), keep "
@@ -293,6 +305,11 @@ def _run(args) -> int:
             )
 
             for a in actions:
+                if args.clamp_height > 0.0:
+                    pos_now, _ = runtime.get_ee_pose_b(h, controller)
+                    if pos_now[2] + a[2] > args.clamp_height:
+                        a = a.copy()
+                        a[2] = max(0.0, float(args.clamp_height - pos_now[2]))
                 g_cmd = schema.GRIPPER_OPEN if a[6] > 0.0 else schema.GRIPPER_CLOSE
                 if g_cmd == schema.GRIPPER_CLOSE and (
                     (args.close_on_arrival > 0.0 and commanded_leaf is not None)
