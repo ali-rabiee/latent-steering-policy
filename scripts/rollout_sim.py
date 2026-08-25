@@ -261,7 +261,7 @@ def _run(args) -> int:
     # The descend tolerance must be tight: it is applied to the 3-D error, so a
     # loose value lets the descent stop that far ABOVE the grasp height, and the
     # demos close within 1 mm of 0.047.
-    EXPERT_TOL_DESCEND_M = 0.004
+    EXPERT_TOL_DESCEND_M = 0.0015
     # Demos wait 4-5 ticks between closing and lifting (156 wait 4, 264 wait 5);
     # the fingers need that long to reach the 1.2 rad closed target.
     EXPERT_CLOSE_HOLD = 8   # collection settles 0.3 s then closes over 0.6 s
@@ -280,7 +280,13 @@ def _run(args) -> int:
         return err
 
     def expert_action(pos_b, box_xy, phase, hold):
-        """Return (dpos, gripper, phase, hold) for one policy tick."""
+        """Return (target_pos_abs, gripper, phase, hold) for one policy tick.
+
+        Absolute, not a delta. collect_boxes drives every phase to an absolute
+        goal (_run_segment) and holds at that same absolute goal (_hold_at); a
+        delta round-trip loses a few mm per tick, which showed up as closing
+        7 mm off in xy and 8.5 mm high while collection lands sub-millimetre.
+        """
         home_z = float(home_pose_z)
         grasp_z = box_top_z + EXPERT_EE_Z_OFFSET + EXPERT_GRASP_DEPTH
         lift_z = box_top_z + EXPERT_EE_Z_OFFSET + EXPERT_TRAVEL_H
@@ -289,25 +295,26 @@ def _run(args) -> int:
             1: np.array([box_xy[0], box_xy[1], grasp_z], dtype=np.float64),  # descend
             2: np.array([box_xy[0], box_xy[1], lift_z], dtype=np.float64),   # lift
         }
-        if phase == "grip":  # sit still while the fingers close
+        if phase == "grip":  # hold the grasp pose while the fingers close
             hold += 1
-            return np.zeros(3), schema.GRIPPER_CLOSE, ("lift" if hold >= EXPERT_CLOSE_HOLD else "grip"), hold
+            return targets[1], schema.GRIPPER_CLOSE, ("lift" if hold >= EXPERT_CLOSE_HOLD else "grip"), hold
         if phase == "done":  # hold the lifted pose so the success test can settle
-            return np.zeros(3), schema.GRIPPER_CLOSE, "done", hold
+            return targets[2], schema.GRIPPER_CLOSE, "done", hold
         idx = {"align": 0, "descend": 1, "lift": 2}[phase]
         tgt = targets[idx]
         err = tgt - np.asarray(pos_b, dtype=np.float64)
         tol = EXPERT_TOL_ALIGN_M if phase == "align" else EXPERT_TOL_DESCEND_M
         if float(np.linalg.norm(err)) < tol:
             if phase == "align":
-                return np.zeros(3), schema.GRIPPER_OPEN, "descend", hold
+                return targets[1], schema.GRIPPER_OPEN, "descend", hold
             if phase == "descend":
-                return np.zeros(3), schema.GRIPPER_CLOSE, "grip", hold
-            return np.zeros(3), schema.GRIPPER_CLOSE, "done", hold
+                return tgt, schema.GRIPPER_CLOSE, "grip", hold
+            return tgt, schema.GRIPPER_CLOSE, "done", hold
+        # rate-limit the approach, but always toward the ABSOLUTE waypoint
         n = float(np.linalg.norm(err))
-        step = err * min(1.0, EXPERT_STEP_M / max(n, 1e-9))
+        capped = np.asarray(pos_b, dtype=np.float64) + err * min(1.0, EXPERT_STEP_M / max(n, 1e-9))
         grip = schema.GRIPPER_OPEN if phase in ("align", "descend") else schema.GRIPPER_CLOSE
-        return step, grip, phase, hold
+        return capped, grip, phase, hold
 
     home_pose_z = 0.248  # replaced with the measured home pose below
     box_top_z = 0.036   # replaced per episode from the actual box
@@ -406,11 +413,12 @@ def _run(args) -> int:
             if args.expert:
                 # one expert tick per policy tick, same cadence as act_horizon
                 pos_now, _ = runtime.get_ee_pose_b(h, controller)
-                dpos, g_exp, expert_phase, expert_hold = expert_action(
+                tgt_abs, g_exp, expert_phase, expert_hold = expert_action(
                     pos_now, box_xy_b, expert_phase, expert_hold
                 )
+                expert_target_abs = np.asarray(tgt_abs, dtype=np.float64)
                 actions = np.zeros((1, 7), dtype=np.float32)
-                actions[0, 0:3] = dpos
+                actions[0, 0:3] = expert_target_abs - np.asarray(pos_now, dtype=np.float64)
                 actions[0, 6] = g_exp
                 replans.append(
                     {
@@ -496,8 +504,11 @@ def _run(args) -> int:
                     # Position stays relative because the policy emits deltas;
                     # only ORIENTATION is held absolutely, which is what the twist
                     # path got wrong.
-                    cur_pos, _ = runtime.get_ee_pose_b(h, controller)
-                    tgt_pos = np.asarray(cur_pos, dtype=np.float64) + np.asarray(a[0:3], dtype=np.float64)
+                    if args.expert:
+                        tgt_pos = expert_target_abs  # absolute, as collect_boxes does
+                    else:
+                        cur_pos, _ = runtime.get_ee_pose_b(h, controller)
+                        tgt_pos = np.asarray(cur_pos, dtype=np.float64) + np.asarray(a[0:3], dtype=np.float64)
                     diffik.set_gripper(gripper == schema.GRIPPER_CLOSE)
                     for j in range(n_phys):
                         render = ((j + 1) == n_phys) or ((j + 1) % render_stride == 0)
