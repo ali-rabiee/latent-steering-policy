@@ -226,8 +226,14 @@ def _run(args) -> int:
     EXPERT_GRASP_Z = 0.047
     EXPERT_LIFT_Z = EXPERT_GRASP_Z + 0.207
     EXPERT_STEP_M = 0.03      # demos travel ~0.030 m per 5 Hz tick
-    EXPERT_TOL_M = 0.012
-    EXPERT_CLOSE_HOLD = 3     # ticks held closed before lifting
+    EXPERT_TOL_ALIGN_M = 0.012
+    # The descend tolerance must be tight: it is applied to the 3-D error, so a
+    # loose value lets the descent stop that far ABOVE the grasp height, and the
+    # demos close within 1 mm of 0.047.
+    EXPERT_TOL_DESCEND_M = 0.004
+    # Demos wait 4-5 ticks between closing and lifting (156 wait 4, 264 wait 5);
+    # the fingers need that long to reach the 1.2 rad closed target.
+    EXPERT_CLOSE_HOLD = 6
 
     def expert_action(pos_b, box_xy, phase, hold):
         """Return (dpos, gripper, phase, hold) for one policy tick."""
@@ -245,7 +251,8 @@ def _run(args) -> int:
         idx = {"align": 0, "descend": 1, "lift": 2}[phase]
         tgt = targets[idx]
         err = tgt - np.asarray(pos_b, dtype=np.float64)
-        if float(np.linalg.norm(err)) < EXPERT_TOL_M:
+        tol = EXPERT_TOL_ALIGN_M if phase == "align" else EXPERT_TOL_DESCEND_M
+        if float(np.linalg.norm(err)) < tol:
             if phase == "align":
                 return np.zeros(3), schema.GRIPPER_OPEN, "descend", hold
             if phase == "descend":
@@ -301,6 +308,7 @@ def _run(args) -> int:
         # of how far the target is -- that makes it a measure of gripper timing,
         # not of which box the arm actually travelled to. This one is timing-free.
         closest = {k: float("inf") for k in boxes_xy_b}
+        max_lift_seen = 0.0
         latched = False
         commit_xy = None  # E1 mode-lock: xy endpoint committed at the first replan
         commanded_leaf = None
@@ -432,6 +440,11 @@ def _run(args) -> int:
 
                 snap = runtime.box_snapshot(h)
                 lifts = {k: float(snap[k][2] - boxes0[k][2]) for k in snap if k in boxes0}
+                if lifts:
+                    # how far the box ACTUALLY moved, whether or not it cleared
+                    # the threshold: 0 means the fingers never gripped it, a
+                    # small positive value means it was gripped and slipped.
+                    max_lift_seen = max(max_lift_seen, max(lifts.values()))
                 if lifts and max(lifts.values()) > args.lift_thresh:
                     success = True
                     if reached_leaf is None:
@@ -444,15 +457,17 @@ def _run(args) -> int:
         approached = min(closest, key=closest.get) if closest else None
         results.append({"episode": ep, "success": success, "reached": reached_leaf, "label": label,
                         "commanded": commanded_leaf, "approached": approached,
+                        "max_lift_m": round(float(max_lift_seen), 4),
                         "closest": {k: round(v, 4) for k, v in closest.items()}})
         cmd_str = f" commanded={commanded_leaf}" if commanded_leaf else ""
-        print(f"[ep {ep:03d}] success={success} reached={reached_leaf} ({label}){cmd_str} steps={step}")
+        print(f"[ep {ep:03d}] success={success} reached={reached_leaf} ({label}){cmd_str} lift={max_lift_seen:.3f} steps={step}")
 
         np.savez_compressed(
             out_dir / f"episode_{ep:04d}.npz",
             success=success,
             reached=str(reached_leaf),
             approached=str(approached),
+            max_lift_m=np.float32(max_lift_seen),
             closest_ids=np.array(sorted(closest.keys())),
             closest_dist=np.array([closest[k] for k in sorted(closest.keys())], dtype=np.float32),
             label=label,
@@ -490,6 +505,10 @@ def _run(args) -> int:
         "per_box_closest_approach": {
             k: v / max(1, len(results)) for k, v in approach_counts.items()
         },
+        # box displacement regardless of the threshold: separates "never gripped"
+        # (0.000) from "gripped then slipped" (small positive)
+        "max_lift_m_median": float(np.median([r["max_lift_m"] for r in results])),
+        "max_lift_m_best": float(max(r["max_lift_m"] for r in results)),
         "median_closest_approach_m": float(
             np.median([min(r["closest"].values()) for r in results if r["closest"]])
         ),
