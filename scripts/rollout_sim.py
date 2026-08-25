@@ -479,10 +479,16 @@ def _run(args) -> int:
                     reached_leaf = min(d, key=d.get)
                 gripper = g_cmd
                 if diffik is not None:
-                    # accumulate the delta into an ABSOLUTE pose target and drive
-                    # the same controller collection used; orientation stays at the
-                    # episode reference so the wrist cannot random-walk.
-                    tgt_pos = tgt_pos + np.asarray(a[0:3], dtype=np.float64)
+                    # Target = CURRENT pose + this step's delta, recomputed every
+                    # tick. A free-running accumulator diverges from the arm: when
+                    # tracking lags, the target keeps advancing and the arm
+                    # overshoots, which showed up as the EE oscillating +/-0.10 m
+                    # around the box (even below the table) instead of settling.
+                    # Position stays relative because the policy emits deltas;
+                    # only ORIENTATION is held absolutely, which is what the twist
+                    # path got wrong.
+                    cur_pos, _ = runtime.get_ee_pose_b(h, controller)
+                    tgt_pos = np.asarray(cur_pos, dtype=np.float64) + np.asarray(a[0:3], dtype=np.float64)
                     diffik.set_gripper(gripper == schema.GRIPPER_CLOSE)
                     for j in range(n_phys):
                         render = ((j + 1) == n_phys) or ((j + 1) % render_stride == 0)
