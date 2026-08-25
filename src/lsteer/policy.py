@@ -42,6 +42,12 @@ class PolicyConfig:
     # E2: >0 appends a goal vector (target colour one-hot + xy) to the global
     # conditioning. 0 keeps the original unconditioned architecture.
     goal_dim: int = 0
+    # E3: relative weight of the gripper channel in the denoising loss. Under a
+    # flat 7-channel MSE the gripper is learned as bimodal +/-1 noise -- in
+    # rollout it flips shut ~1.6 s in and back open a moment later -- while the
+    # demos are unambiguous, closing at EE height 0.047 m (p5 0.047, p95 0.048)
+    # at the bottom of the descent, every one of 420 episodes.
+    grip_loss_weight: float = 1.0
 
 
 class DiffusionPolicy(nn.Module):
@@ -96,6 +102,10 @@ class DiffusionPolicy(nn.Module):
         noise = torch.randn_like(action_n)
         x_t = self.schedule.q_sample(action_n, t, noise)
         pred = self.unet(x_t, t, cond)
+        if self.cfg.grip_loss_weight != 1.0:
+            w = torch.ones(self.cfg.action_dim, device=pred.device, dtype=pred.dtype)
+            w[6] = self.cfg.grip_loss_weight
+            return (w * (pred - noise) ** 2).mean()
         return F.mse_loss(pred, noise)
 
     # ------------------------------------------------------------ inference

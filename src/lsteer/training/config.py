@@ -59,6 +59,9 @@ class OptimConfig:
     warmup_steps: int = 500
     ema_inv_gamma: float = 1.0
     ema_power: float = 0.75
+    # E3: relative weight of the gripper channel in the denoising loss (see
+    # PolicyConfig.grip_loss_weight)
+    grip_loss_weight: float = 1.0
 
 
 @dataclass

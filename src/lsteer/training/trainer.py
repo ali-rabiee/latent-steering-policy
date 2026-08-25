@@ -126,6 +126,7 @@ class Trainer:
             num_inference_steps=cfg.diffusion.infer_steps,
             clip_sample=cfg.diffusion.clip_sample,
             goal_dim=schema.GOAL_DIM if cfg.data.goal_conditioned else 0,
+            grip_loss_weight=cfg.optim.grip_loss_weight,
         )
         self.policy = DiffusionPolicy(policy_cfg).to(cfg.device)
         self.policy.schedule.to(cfg.device)
