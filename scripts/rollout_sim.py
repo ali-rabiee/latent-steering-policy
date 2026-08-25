@@ -53,6 +53,17 @@ def main() -> int:
         "closest (xy) to the commitment. 0 = off (one fresh sample per replan).",
     )
     parser.add_argument(
+        "--close-on-arrival",
+        type=float,
+        default=0.0,
+        metavar="RADIUS_M",
+        help="E3a: veto GRIPPER_CLOSE until the EE is within RADIUS of the commanded "
+        "box. The demos close the gripper on arrival (distance ~0 in all 420), but the "
+        "trained gripper channel is bimodal noise that flips closed ~1.6 s in, long "
+        "before the arm gets there. 0 = off. Needs a commanded box (goal ckpt or "
+        "--steer-to-box).",
+    )
+    parser.add_argument(
         "--steer-to-box",
         action="store_true",
         help="E1b: instead of committing to the policy's own first endpoint, "
@@ -196,6 +207,13 @@ def _run(args) -> int:
         reached_leaf = None
         success = False
         boxes0 = runtime.box_snapshot(h)
+        origin_b = np.asarray(h.scene_origins[0], dtype=np.float32)
+        boxes_xy_b = {k: (v - origin_b)[0:2] for k, v in boxes0.items()}
+        # closest approach per box over the whole episode. `reached_leaf` is
+        # recorded at the first gripper close, which fires ~1.6 s in regardless
+        # of how far the target is -- that makes it a measure of gripper timing,
+        # not of which box the arm actually travelled to. This one is timing-free.
+        closest = {k: float("inf") for k in boxes_xy_b}
         commit_xy = None  # E1 mode-lock: xy endpoint committed at the first replan
         commanded_leaf = None
         goal_vec = None
@@ -254,6 +272,14 @@ def _run(args) -> int:
 
             for a in actions:
                 g_cmd = schema.GRIPPER_OPEN if a[6] > 0.0 else schema.GRIPPER_CLOSE
+                if (
+                    args.close_on_arrival > 0.0
+                    and commanded_leaf is not None
+                    and g_cmd == schema.GRIPPER_CLOSE
+                ):
+                    pos_now, _ = runtime.get_ee_pose_b(h, controller)
+                    if float(np.linalg.norm(pos_now[0:2] - box_xy_b)) > args.close_on_arrival:
+                        g_cmd = schema.GRIPPER_OPEN  # not there yet
                 if g_cmd != gripper and g_cmd == schema.GRIPPER_CLOSE and reached_leaf is None:
                     # record which box we are committing to at first close
                     pos_b, _ = runtime.get_ee_pose_b(h, controller)
@@ -269,8 +295,10 @@ def _run(args) -> int:
                 run_phys_steps(n_phys)
                 step += 1
 
-                imgs, state, _ = observe(gripper, save_to=frame_dir, tick=step)
+                imgs, state, ee_now = observe(gripper, save_to=frame_dir, tick=step)
                 obs_hist.append((imgs, state))
+                for leaf, bxy in boxes_xy_b.items():
+                    closest[leaf] = min(closest[leaf], float(np.linalg.norm(ee_now[0:2] - bxy)))
 
                 snap = runtime.box_snapshot(h)
                 lifts = {k: float(snap[k][2] - boxes0[k][2]) for k in snap if k in boxes0}
@@ -283,8 +311,10 @@ def _run(args) -> int:
                 break
 
         label = h.id_to_label.get(reached_leaf or "", "")
+        approached = min(closest, key=closest.get) if closest else None
         results.append({"episode": ep, "success": success, "reached": reached_leaf, "label": label,
-                        "commanded": commanded_leaf})
+                        "commanded": commanded_leaf, "approached": approached,
+                        "closest": {k: round(v, 4) for k, v in closest.items()}})
         cmd_str = f" commanded={commanded_leaf}" if commanded_leaf else ""
         print(f"[ep {ep:03d}] success={success} reached={reached_leaf} ({label}){cmd_str} steps={step}")
 
@@ -292,6 +322,9 @@ def _run(args) -> int:
             out_dir / f"episode_{ep:04d}.npz",
             success=success,
             reached=str(reached_leaf),
+            approached=str(approached),
+            closest_ids=np.array(sorted(closest.keys())),
+            closest_dist=np.array([closest[k] for k in sorted(closest.keys())], dtype=np.float32),
             label=label,
             layout_ids=np.array(sorted(layout_w.keys())),
             layout_pos_w=np.stack([layout_w[k] for k in sorted(layout_w.keys())]),
@@ -311,10 +344,25 @@ def _run(args) -> int:
     for r in results:
         if r["reached"]:
             reached_counts[r["label"] or r["reached"]] = reached_counts.get(r["label"] or r["reached"], 0) + 1
+    approach_counts: dict[str, int] = {}
+    for r in results:
+        if r["approached"]:
+            lab = h.id_to_label.get(r["approached"], "") or r["approached"]
+            approach_counts[lab] = approach_counts.get(lab, 0) + 1
     summary = {
         "episodes": len(results),
         "success_rate": n_success / max(1, len(results)),
         "per_box_coverage": {k: v / max(1, len(results)) for k, v in reached_counts.items()},
+        # Timing-free companion to per_box_coverage: which box the arm actually
+        # travelled to, by closest approach over the episode. per_box_coverage is
+        # recorded at the first gripper close (~1.6 s in), so on a far target it
+        # names whichever box was nearest at that instant, not the destination.
+        "per_box_closest_approach": {
+            k: v / max(1, len(results)) for k, v in approach_counts.items()
+        },
+        "median_closest_approach_m": float(
+            np.median([min(r["closest"].values()) for r in results if r["closest"]])
+        ),
         "ckpt": str(args.ckpt),
         "seed": args.seed,
     }
@@ -327,6 +375,21 @@ def _run(args) -> int:
         summary["per_command"] = {
             k: {"n": v["n"], "correct": v["correct"], "accuracy": v["correct"] / max(1, v["n"])}
             for k, v in sorted(per_cmd.items())
+        }
+        per_cmd_app: dict[str, dict[str, float]] = {}
+        for r in results:
+            c = per_cmd_app.setdefault(r["commanded"], {"n": 0, "correct": 0, "dist": []})
+            c["n"] += 1
+            c["correct"] += int(r["approached"] == r["commanded"])
+            c["dist"].append(r["closest"].get(r["commanded"], float("nan")))
+        summary["per_command_closest_approach"] = {
+            k: {
+                "n": v["n"],
+                "correct": v["correct"],
+                "accuracy": v["correct"] / max(1, v["n"]),
+                "mean_dist_to_commanded_m": round(float(np.nanmean(v["dist"])), 4),
+            }
+            for k, v in sorted(per_cmd_app.items())
         }
     print(json.dumps(summary, indent=2))
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
