@@ -76,6 +76,16 @@ def main() -> int:
         "they have drifted ~16 cm away. 0 = off.",
     )
     parser.add_argument(
+        "--exec-diffik",
+        action="store_true",
+        help="STAGE 0c: execute through DifferentialIKController with ABSOLUTE pose targets, the "
+        "way collect_boxes.py does, instead of feeding delta twists to the jog controller. The "
+        "policy still outputs deltas; they are accumulated into a target pose. Collection lifts "
+        "12/12 on this path while the twist path lifts 0/40 with the box never moving, so every "
+        "grasp number measured through the twist path is suspect. Orientation is held at the "
+        "episode-start reference with yaw free (top-down task).",
+    )
+    parser.add_argument(
         "--hold-orientation",
         action="store_true",
         help="HARNESS FIX: hold the wrist at its episode-start orientation, correcting roll and "
@@ -187,6 +197,7 @@ def _run(args) -> int:
     controller = runtime.make_twist_controller(h)
     provider = runtime.ChunkActionProvider(device=str(h.sim.device))
     controller.set_input_provider(provider)
+    diffik = runtime.make_diffik_driver(h, controller) if args.exec_diffik else None
 
     n_phys = max(1, round((1.0 / schema.FPS) / h.dt))
     steps_per_episode = int(args.max_duration_s * schema.FPS)
@@ -236,6 +247,11 @@ def _run(args) -> int:
     # the collection expert never rotates during a box reach either.
     # Heights come from the demos rather than from the world->base transform:
     # they close at EE z = 0.047 (1 mm spread) and lift 0.207 m from there.
+    # collect_boxes.py geometry (the path that lifts 12/12):
+    #   grasp_z = box_top + ee_z_offset(0.08) + grasp_depth(-0.07) = box_top + 0.01
+    #   approach from box_top + ee_z_offset + travel_height(0.14) = box_top + 0.22
+    # box_top in the EE frame is the demos' close height, 0.047, so grasp_z is
+    # that value and the approach sits 0.21 m above it.
     EXPERT_GRASP_Z = 0.047
     EXPERT_LIFT_Z = EXPERT_GRASP_Z + 0.207
     EXPERT_STEP_M = 0.03      # demos travel ~0.030 m per 5 Hz tick
@@ -327,7 +343,8 @@ def _run(args) -> int:
         reached_leaf = None
         success = False
         boxes0 = runtime.box_snapshot(h)
-        _, quat_ref = runtime.get_ee_pose_b(h, controller)  # top-down reference
+        tgt_pos, quat_ref = runtime.get_ee_pose_b(h, controller)  # top-down reference
+        tgt_pos = np.asarray(tgt_pos, dtype=np.float64).copy()  # absolute target for --exec-diffik
         origin_b = np.asarray(h.scene_origins[0], dtype=np.float32)
         boxes_xy_b = {k: (v - origin_b)[0:2] for k, v in boxes0.items()}
         # closest approach per box over the whole episode. `reached_leaf` is
@@ -461,8 +478,18 @@ def _run(args) -> int:
                     }
                     reached_leaf = min(d, key=d.get)
                 gripper = g_cmd
-                provider.set_step(a[0:3], a[3:6], gripper, n_phys)
-                run_phys_steps(n_phys)
+                if diffik is not None:
+                    # accumulate the delta into an ABSOLUTE pose target and drive
+                    # the same controller collection used; orientation stays at the
+                    # episode reference so the wrist cannot random-walk.
+                    tgt_pos = tgt_pos + np.asarray(a[0:3], dtype=np.float64)
+                    diffik.set_gripper(gripper == schema.GRIPPER_CLOSE)
+                    for j in range(n_phys):
+                        render = ((j + 1) == n_phys) or ((j + 1) % render_stride == 0)
+                        diffik.step(tgt_pos, quat_ref, render=render)
+                else:
+                    provider.set_step(a[0:3], a[3:6], gripper, n_phys)
+                    run_phys_steps(n_phys)
                 step += 1
 
                 imgs, state, ee_now = observe(gripper, save_to=frame_dir, tick=step)

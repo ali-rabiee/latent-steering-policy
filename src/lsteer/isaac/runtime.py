@@ -322,3 +322,87 @@ def teleport_box(h: SimHandles, prim_path: str, pos_w: tuple[float, float, float
     if hasattr(view, "set_velocities"):
         view.set_velocities(torch.zeros(n, 6, device=t0.device), indices=idx)
     return True
+
+
+class DiffIKDriver:
+    """Absolute-pose execution, mirroring collect_boxes.py's proven grasp path.
+
+    The jog controller integrates DELTA twists and, in "twist" mode, derives the
+    desired orientation as quat_box_plus(current, drot) -- an integrator with no
+    reference, so IK tracking error random-walks the wrist away with nothing
+    restoring it. Measured on a scripted expert commanding zero rotation: 0.0007
+    from the demo orientation at episode start, 0.145 by the gripper close, 1.84
+    by the end, and the box never moved in 40/40 episodes.
+
+    Collection instead drives DifferentialIKController with an ABSOLUTE pose
+    target every step (data_collection/collect_boxes.py::_drive_ik_step) and
+    holds the orientation constant through a grasp. That path lifts 12/12. This
+    class reproduces it so a policy can be evaluated the way its data was made.
+    """
+
+    def __init__(self, h: SimHandles, controller, ee_link: str = "j2n6s300_end_effector"):
+        from isaaclab.controllers import DifferentialIKController, DifferentialIKControllerCfg
+
+        self.h = h
+        self.controller = controller
+        self.robot = h.robot
+        # the jog controller already resolved these against this robot
+        self._ee_body_id = int(controller._ee_body_id)
+        self._ee_jacobi_idx = int(controller._ee_jacobi_idx)
+        self._arm_joint_ids = controller._arm_joint_ids
+        self.diff_ik = DifferentialIKController(
+            DifferentialIKControllerCfg(command_type="pose", use_relative_mode=False, ik_method="dls"),
+            num_envs=1,
+            device=str(h.sim.device),
+        )
+        self.diff_ik.reset()
+
+    def step(self, pos_des_b, quat_des_b, *, render: bool = False) -> None:
+        """One physics step driving the EE toward an ABSOLUTE base-frame pose."""
+        import torch
+
+        robot = self.robot
+        jac = robot.root_physx_view.get_jacobians()[:, self._ee_jacobi_idx, :, self._arm_joint_ids]
+        q_arm = robot.data.joint_pos[:, self._arm_joint_ids]
+        pos_b, quat_b = get_ee_pose_b(self.h, self.controller)
+        dev = robot.data.joint_pos.device
+        p_des = torch.as_tensor(pos_des_b, dtype=torch.float32, device=dev).unsqueeze(0)
+        q_des_t = torch.as_tensor(quat_des_b, dtype=torch.float32, device=dev).unsqueeze(0)
+        cur_p = torch.as_tensor(pos_b, dtype=torch.float32, device=dev).unsqueeze(0)
+        cur_q = torch.as_tensor(quat_b, dtype=torch.float32, device=dev).unsqueeze(0)
+        self.diff_ik.ee_pos_des[:] = p_des
+        self.diff_ik.ee_quat_des[:] = q_des_t
+        q_cmd = self.diff_ik.compute(cur_p, cur_q, jac, q_arm)
+        robot.set_joint_position_target(robot.data.joint_pos)
+        robot.set_joint_position_target(q_cmd, joint_ids=self._arm_joint_ids)
+        robot.set_joint_velocity_target(torch.zeros_like(robot.data.joint_vel))
+        try:
+            self.controller.gripper.apply_hold(robot)
+        except Exception:
+            pass
+        try:
+            robot.set_joint_effort_target(robot.root_physx_view.get_gravity_compensation_forces())
+        except Exception:
+            pass
+        robot.write_data_to_sim()
+        # Same render bookkeeping as step_sim: the wrist camera is NOT parented
+        # to the arm, so it must be synced before every render or it silently
+        # returns a static view and the policy sees a frozen wrist image.
+        if render:
+            sync_cameras(self.h)
+        self.h.sim.step(render=render)
+        robot.update(self.h.dt)
+        if render:
+            for sensor in self.h.cameras.values():
+                sensor.update(self.h.dt)
+
+    def set_gripper(self, closed: bool) -> None:
+        """Command the fingers, the way collect_boxes does (not via the jog controller)."""
+        if closed:
+            self.controller.gripper.command_close(self.robot)
+        else:
+            self.controller.gripper.command_open(self.robot)
+
+
+def make_diffik_driver(h: SimHandles, controller, ee_link: str = "j2n6s300_end_effector") -> DiffIKDriver:
+    return DiffIKDriver(h, controller, ee_link)
