@@ -76,6 +76,18 @@ def main() -> int:
         "they have drifted ~16 cm away. 0 = off.",
     )
     parser.add_argument(
+        "--hold-orientation",
+        action="store_true",
+        help="HARNESS FIX: hold the wrist at its episode-start orientation, correcting roll and "
+        "pitch only and leaving yaw free (this is a top-down task: the gripper yaws to fit its "
+        "fingers to the box and must not tip in any other direction). Collection runs the "
+        "controller in 'translate' mode, which calls hold_orientation() against a captured "
+        "reference; rollout runs 'twist', which does quat_box_plus(current, drot) -- an integrator "
+        "with no reference, so IK tracking error random-walks the wrist away with nothing "
+        "restoring it. Measured on the scripted expert commanding ZERO rotation: 0.0007 from the "
+        "demo orientation at episode start, 0.145 by the gripper close, 1.84 by the end.",
+    )
+    parser.add_argument(
         "--expert",
         action="store_true",
         help="STAGE 0: drive the arm with the scripted expert instead of the policy, through the "
@@ -158,6 +170,7 @@ def _run(args) -> int:
     from lsteer.data.obs import build_lowdim_obs, center_crop, image_to_tensor, resize_to_storage
     from lsteer.isaac import runtime
     from lsteer.policy import DiffusionPolicy
+    from lsteer.utils.rotations import delta_rotvec
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     policy = DiffusionPolicy.load(args.ckpt, device=device)
@@ -235,6 +248,19 @@ def _run(args) -> int:
     # the fingers need that long to reach the 1.2 rad closed target.
     EXPERT_CLOSE_HOLD = 6
 
+    def orientation_correction(quat_now_np, quat_ref_np):
+        """Rotvec that pulls roll/pitch back to the reference, leaving yaw alone.
+
+        Top-down task: the gripper may yaw to fit its fingers to the box, but any
+        roll or pitch is drift and gets corrected. The error is expressed in the
+        BASE frame, so its z component is the yaw part and is simply dropped.
+        """
+        q_now = torch.from_numpy(np.asarray(quat_now_np, dtype=np.float32)).unsqueeze(0)
+        q_ref = torch.from_numpy(np.asarray(quat_ref_np, dtype=np.float32)).unsqueeze(0)
+        err = delta_rotvec(q_now, q_ref)[0].numpy()  # base-frame rotvec now -> ref
+        err[2] = 0.0  # keep yaw: fingers must be free to align with the box
+        return err
+
     def expert_action(pos_b, box_xy, phase, hold):
         """Return (dpos, gripper, phase, hold) for one policy tick."""
         home_z = float(home_pose_z)
@@ -301,6 +327,7 @@ def _run(args) -> int:
         reached_leaf = None
         success = False
         boxes0 = runtime.box_snapshot(h)
+        _, quat_ref = runtime.get_ee_pose_b(h, controller)  # top-down reference
         origin_b = np.asarray(h.scene_origins[0], dtype=np.float32)
         boxes_xy_b = {k: (v - origin_b)[0:2] for k, v in boxes0.items()}
         # closest approach per box over the whole episode. `reached_leaf` is
@@ -394,6 +421,10 @@ def _run(args) -> int:
                 )
 
             for a in actions:
+                if args.hold_orientation:
+                    _, quat_now = runtime.get_ee_pose_b(h, controller)
+                    a = a.copy()
+                    a[3:6] = a[3:6] + orientation_correction(quat_now, quat_ref)
                 if args.clamp_height > 0.0:
                     pos_now, _ = runtime.get_ee_pose_b(h, controller)
                     if pos_now[2] + a[2] > args.clamp_height:
