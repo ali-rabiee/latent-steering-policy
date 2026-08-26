@@ -22,6 +22,8 @@ import torch
 
 from lsteer.data import schema
 
+_RB_VIEWS: dict[str, object] = {}
+
 BOX_COLORS: list[tuple[str, tuple[float, float, float]]] = [
     ("red", (0.85, 0.20, 0.20)),
     ("blue", (0.20, 0.35, 0.90)),
@@ -125,6 +127,9 @@ def build_sim(
 
 def reset_sim_and_robot(h: SimHandles) -> None:
     """Same as vla_v1's _reset_sim_and_robot."""
+    # sim.reset() invalidates every physics view; cached rigid-body views would
+    # then raise "Failed to get rigid body transforms from backend" on next use.
+    _RB_VIEWS.clear()
     h.sim.reset()
     origin0 = torch.tensor(h.scene_origins[0], device=h.sim.device)
     root_state = h.robot.data.default_root_state.clone()
@@ -291,9 +296,6 @@ def step_sim(h: SimHandles, controller, *, render: bool) -> None:
             sensor.update(h.dt)
 
 
-_RB_VIEWS: dict[str, object] = {}
-
-
 def _rigid_view(prim_path: str):
     """Cached PhysX rigid-body view for a spawned box."""
     from isaacsim.core.simulation_manager import SimulationManager
@@ -332,12 +334,21 @@ def box_snapshot(h: SimHandles) -> dict[str, np.ndarray]:
     out: dict[str, np.ndarray] = {}
     for path in h.spawned_paths:
         leaf = str(path).split("/")[-1]
-        view = _rigid_view(path)
-        if view is not None:
-            t = view.get_transforms()  # [x, y, z, qx, qy, qz, qw]
-            out[leaf] = np.asarray(
-                [float(t[0][0]), float(t[0][1]), float(t[0][2])], dtype=np.float32
-            )
+        for attempt in (0, 1):
+            view = _rigid_view(path)
+            if view is None:
+                break
+            try:
+                t = view.get_transforms()  # [x, y, z, qx, qy, qz, qw]
+                out[leaf] = np.asarray(
+                    [float(t[0][0]), float(t[0][1]), float(t[0][2])], dtype=np.float32
+                )
+                break
+            except Exception:
+                # stale view (the sim was reset since it was made): drop and remake
+                _RB_VIEWS.pop(path, None)
+                if attempt:
+                    raise
     if out:
         return out
     for o in h.tracker.snapshot():  # last resort: whatever the tracker can see
