@@ -89,6 +89,14 @@ def build_sim(
         box_color_names=[n for (n, _r) in BOX_COLORS],
         **object_loader_kwargs_from_physix(env.physics_cfg),
     )
+    # ObjectLoader places boxes with the GLOBAL random module, so without this
+    # every job gets a different table -- and box distance from the home pose
+    # drives lift success (34% within 0.33 m vs 18.6% beyond it). Comparing two
+    # checkpoints on two different tables measures the tables as much as the
+    # policy. Seeding makes a run reproducible and comparisons fair.
+    import random as _random
+
+    _random.seed(int(getattr(args, "seed", 0)))
     loader = ObjectLoader(loader_cfg)
     spawned_paths = loader.spawn(parent_prim_path="/World/Origin1", num_objects=num_objects)
     id_to_label = {}
