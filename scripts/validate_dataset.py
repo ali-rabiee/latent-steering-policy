@@ -43,7 +43,7 @@ def _fail(msg: str) -> tuple[bool, str]:
     return False, msg
 
 
-def check_zarr(path: Path, action_tol: float = 2e-3) -> int:
+def check_zarr(path: Path, action_tol: float = 2e-3, max_step: float = 0.09) -> int:
     import zarr
 
     root = zarr.open(str(path), mode="r")
@@ -85,6 +85,31 @@ def check_zarr(path: Path, action_tol: float = 2e-3) -> int:
         problems.append(
             f"action/state mismatch up to {worst*1000:.1f} mm in episode {worst_ep} - the recorded "
             "actions do not describe the recorded motion, so training would learn the discrepancy")
+
+    # 2b. no action is larger than a real motion can be
+    #
+    # The consistency check above CANNOT catch a teleport: if the logs skip a
+    # gap, action[t] still equals pose[t+1]-pose[t], so it is perfectly
+    # "consistent" while describing a motion that never happened. This is how a
+    # recovery dataset acquired 210 fake 0.31 m jumps -- 0.88% of frames
+    # carrying 20.9% of the squared position error, which collapsed training to
+    # 0% success. Magnitude is the only thing that catches it.
+    mag = np.linalg.norm(action[:, 0:3], axis=1)
+    n_out = int((mag > max_step).sum())
+    ok_mag = n_out == 0
+    print(f"  [{'PASS' if ok_mag else 'FAIL'}] no impossible single-step motions: "
+          f"{n_out} frames above {max_step*1000:.0f} mm (largest {mag.max()*1000:.1f} mm)")
+    if not ok_mag:
+        share = float((action[mag > max_step, 0:3] ** 2).sum() / (action[:, 0:3] ** 2).sum())
+        eps_hit = set()
+        for e in range(n_ep):
+            s_, t_ = int(starts[e]), int(ends[e])
+            if mag[s_:t_].max() > max_step:
+                eps_hit.add(e)
+        problems.append(
+            f"{n_out} frames in {len(eps_hit)} episodes exceed {max_step*1000:.0f} mm in one step "
+            f"and carry {share:.0%} of the squared position error - these are almost certainly "
+            "logging gaps, not motions, and training will spend that fraction of its budget on them")
 
     # 3. finite
     finite = bool(np.isfinite(state).all() and np.isfinite(action).all())
@@ -173,6 +198,8 @@ def main() -> int:
     ap.add_argument("--logs-root", type=Path, default=None)
     ap.add_argument("--action-tol", type=float, default=2e-3,
                     help="max allowed |pos[t] + action[t] - pos[t+1]| in metres")
+    ap.add_argument("--max-step", type=float, default=0.09,
+                    help="largest believable single-step motion [m]; the scripted expert peaks at 0.078")
     args = ap.parse_args()
     if not args.zarr and not args.logs_root:
         ap.error("give --zarr or --logs-root")
@@ -180,7 +207,7 @@ def main() -> int:
     if args.logs_root:
         rc |= check_logs(args.logs_root)
     if args.zarr:
-        rc |= check_zarr(args.zarr, args.action_tol)
+        rc |= check_zarr(args.zarr, args.action_tol, args.max_step)
     return rc
 
 
