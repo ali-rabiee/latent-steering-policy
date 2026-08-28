@@ -110,6 +110,26 @@ def main() -> int:
         "but the network is never queried.",
     )
     parser.add_argument(
+        "--retry-after",
+        type=int,
+        default=0,
+        metavar="N",
+        help="bail out and re-approach after N replans with no lift. 0 = off. Motivated by "
+        "the champion's own control run: a success finishes in a median of 5 replans and "
+        "stops with the EE at +0.022 m, while a failure burns all 25 and ends at -0.021, "
+        "digging into the table. A failed grasp is a stuck state, not a near miss, so "
+        "spending more replans on it cannot help -- retracting restores an observation the "
+        "demonstrations actually cover.",
+    )
+    parser.add_argument(
+        "--retry-height",
+        type=float,
+        default=0.20,
+        help="EE height [m] to retract to on a bail-out, back inside the demonstrated travel band",
+    )
+    parser.add_argument("--max-retries", type=int, default=2, help="bail-outs allowed per episode")
+    parser.add_argument("--retry-ticks", type=int, default=25, help="physics ticks spent retracting")
+    parser.add_argument(
         "--clamp-height",
         type=float,
         default=0.0,
@@ -137,6 +157,36 @@ def main() -> int:
         "command the target box round-robin over episodes and lock to ITS xy "
         "(requires --mode-lock K for the candidate count). Measures the upper "
         "bound of inference-time steering; summary gains a per_command block.",
+    )
+    parser.add_argument(
+        "--replay-demo",
+        type=Path,
+        default=None,
+        metavar="ZARR",
+        help="P0: replay a recorded demonstration's own actions through THIS harness's "
+        "execution path instead of querying the network. The policy is executed as "
+        "tgt_pos = cur_pos + a[0:3], but the --expert validation that produced '12/12 "
+        "lifts' took the ABSOLUTE branch (tgt_pos = expert_target_abs), so the delta "
+        "path has never been validated end-to-end. Spawns the episode's own layout from "
+        "meta/episode_box_positions and feeds data/action through the identical code. "
+        "The network is never queried; --ckpt is still needed for the env config.",
+    )
+    parser.add_argument(
+        "--replay-episode",
+        type=int,
+        default=0,
+        help="first demo episode index to replay; --episodes consecutive episodes with "
+        "--num_objects boxes are taken from here",
+    )
+    parser.add_argument(
+        "--replay-mode",
+        choices=("delta", "abs"),
+        default="delta",
+        help="'delta' drives tgt_pos = cur_pos + a[0:3], the path the POLICY takes. 'abs' "
+        "drives the demo's recorded absolute pose, the path --expert takes and the one "
+        "collect_boxes.py used to record the data. Running both on the same episodes "
+        "isolates execution error from everything else: identical inputs, one line "
+        "different in the executor.",
     )
     parser.add_argument(
         "--save-frames",
@@ -226,6 +276,65 @@ def _run(args) -> int:
     # fixed layout for the whole eval: record spawn poses once
     layout_w = runtime.box_snapshot(h)
     print(f"fixed layout: { {k: np.round(v, 3).tolist() for k, v in layout_w.items()} }")
+
+    # ---- P0: open-loop replay of recorded demonstrations -------------------
+    # The point of this mode is that NOTHING below changes: the same observe(),
+    # the same act_horizon chunking, the same `for a in actions:` executor. Only
+    # the source of `actions` differs (a zarr instead of the network) and the
+    # layout is the demo's instead of the seeded one. Any failure is therefore
+    # attributable to execution, because the actions are known-good by
+    # construction -- they are exactly what produced a successful lift when the
+    # data was collected.
+    replay = None
+    if args.replay_demo is not None:
+        import zarr
+
+        zr = zarr.open(str(args.replay_demo), mode="r")
+        ends = np.asarray(zr[schema.META_EPISODE_ENDS][:])
+        starts = np.concatenate([[0], ends[:-1]])
+        box_pos_b_all = np.asarray(zr[schema.META_BOX_POSITIONS][:])   # (E, MAX_BOXES, 3), base frame
+        box_col_all = np.asarray(zr[schema.META_BOX_COLORS][:])        # (E, MAX_BOXES), -1 padded
+        tgt_col_all = np.asarray(zr[schema.META_TARGET_COLOR][:])
+        n_boxes = (~np.isnan(box_pos_b_all[:, :, 0])).sum(axis=1)
+        # only episodes whose box count matches what this sim spawned: teleporting
+        # 3 demo boxes onto a 4-box table would leave a stray box on the layout
+        # that the demonstration never saw.
+        pool = [
+            int(e)
+            for e in range(args.replay_episode, len(ends))
+            if int(n_boxes[e]) == int(args.num_objects)
+        ][: args.episodes]
+        if len(pool) < args.episodes:
+            print(
+                f"WARNING: only {len(pool)} episodes at/after {args.replay_episode} have "
+                f"{args.num_objects} boxes; replaying those"
+            )
+        # colour id -> spawned leaf, via the label the loader assigned each prim
+        color_to_leaf = {}
+        for leaf, lab in h.id_to_label.items():
+            if lab:
+                color_to_leaf[schema.COLOR_PALETTE.index(lab.split()[0])] = leaf
+        replay = {
+            "episodes": pool,
+            "state": zr[schema.DATA_STATE],
+            "action": zr[schema.DATA_ACTION],
+            "starts": starts,
+            "ends": ends,
+            "box_pos_b": box_pos_b_all,
+            "box_col": box_col_all,
+            "target_col": tgt_col_all,
+            "color_to_leaf": color_to_leaf,
+        }
+        args.episodes = len(pool)
+        print(
+            f"REPLAY mode={args.replay_mode} zarr={args.replay_demo} "
+            f"episodes={pool} color_to_leaf={color_to_leaf}"
+        )
+        if diffik is None:
+            raise SystemExit(
+                "--replay-demo needs --exec-diffik: the delta path under test is the "
+                "diff-IK one the champion rollouts use"
+            )
 
     def observe(gripper_state: float, save_to: Path | None = None, tick: int = 0):
         """One observation: {cam: cropped tensor} + the 10-D low-dim state.
@@ -340,7 +449,21 @@ def _run(args) -> int:
         controller.reset(h.robot)
         controller.set_mode("twist")
         provider.set_step(np.zeros(3), np.zeros(3), schema.GRIPPER_OPEN, 1)
-        for leaf, pos_w in layout_w.items():
+        # in replay mode the table is the DEMO's table, rebuilt from the zarr
+        layout_ep = layout_w
+        demo_ep = None
+        if replay is not None:
+            demo_ep = replay["episodes"][ep]
+            layout_ep = {}
+            for j in range(int(args.num_objects)):
+                c = int(replay["box_col"][demo_ep, j])
+                leaf = replay["color_to_leaf"].get(c)
+                if leaf is None:
+                    raise SystemExit(f"demo colour id {c} has no spawned box")
+                layout_ep[leaf] = runtime.base_to_world_pos(
+                    h, replay["box_pos_b"][demo_ep, j]
+                ).astype(np.float32)
+        for leaf, pos_w in layout_ep.items():
             for p in h.spawned_paths:
                 if p.endswith(leaf):
                     runtime.teleport_box(h, p, tuple(float(v) for v in pos_w))
@@ -392,7 +515,36 @@ def _run(args) -> int:
             box_top_z = float(box_b[2]) + 0.5 * float(args.box_size)
             expert_phase, expert_hold = "align", 0
             home_pose_z = float(runtime.get_ee_pose_b(h, controller)[0][2])
-        if args.steer_to_box or getattr(cfg, "goal_dim", 0) > 0:
+        replay_actions = replay_pos_abs = None
+        if replay is not None:
+            s0, e0 = int(replay["starts"][demo_ep]), int(replay["ends"][demo_ep])
+            replay_actions = np.asarray(replay["action"][s0:e0], dtype=np.float32)
+            demo_states = np.asarray(replay["state"][s0:e0], dtype=np.float32)
+            # pose AFTER action t. states[t] is the pose BEFORE it, and the final
+            # pose is not stored, so the last one is reconstructed from its action
+            # (a_t = pose_{t+1} - pose_t by construction, see data/convert.py).
+            replay_pos_abs = np.concatenate(
+                [demo_states[1:, 0:3], (demo_states[-1, 0:3] + replay_actions[-1, 0:3])[None]]
+            ).astype(np.float64)
+            commanded_leaf = replay["color_to_leaf"][int(replay["target_col"][demo_ep])]
+            origin0 = np.asarray(h.scene_origins[0], dtype=np.float32)
+            box_xy_b = (layout_ep[commanded_leaf] - origin0)[0:2].astype(np.float32)
+            # Prove the layout actually landed where the demo had it, and that the
+            # arm starts where the demo started. Either being wrong would make the
+            # replay a different experiment than the one described.
+            snap_b = {k: (v - origin0) for k, v in boxes0.items()}
+            layout_err = max(
+                float(np.linalg.norm(snap_b[replay["color_to_leaf"][int(replay["box_col"][demo_ep, j])]][0:2]
+                                     - replay["box_pos_b"][demo_ep, j][0:2]))
+                for j in range(int(args.num_objects))
+            )
+            home_err = float(np.linalg.norm(np.asarray(tgt_pos) - demo_states[0, 0:3]))
+            print(
+                f"[ep {ep:03d}] demo={demo_ep} n_act={len(replay_actions)} "
+                f"target={commanded_leaf} layout_xy_err={layout_err*1000:.2f}mm "
+                f"home_err={home_err*1000:.2f}mm"
+            )
+        if replay is None and (args.steer_to_box or getattr(cfg, "goal_dim", 0) > 0):
             leaves = sorted(layout_w.keys())
             commanded_leaf = leaves[ep % len(leaves)]
             origin0 = np.asarray(h.scene_origins[0], dtype=np.float32)
@@ -401,7 +553,7 @@ def _run(args) -> int:
             if args.mode_lock <= 0:
                 raise SystemExit("--steer-to-box requires --mode-lock K")
             commit_xy = box_xy_b
-        if getattr(cfg, "goal_dim", 0) > 0:
+        if replay is None and getattr(cfg, "goal_dim", 0) > 0:
             # E2 goal-conditioned ckpt: command the box explicitly, same
             # round-robin protocol as --steer-to-box
             label = h.id_to_label.get(commanded_leaf, "")
@@ -412,7 +564,48 @@ def _run(args) -> int:
             goal_vec = torch.from_numpy(gv)
 
         step = 0
+        retries = 0
+        replans_since_retry = 0
+        # per-step |achieved EE - demo EE| and the error at the gripper close
+        replay_err: list[float] = []
+        replay_close_err = replay_close_dist_xy = None
         while step < steps_per_episode:
+            if replay is not None and step >= len(replay_actions):
+                break
+            # Bail out of a failing attempt instead of grinding to the cap.
+            #
+            # In the champion's own 40-episode control, a SUCCESS finishes in a
+            # median of 5 replans and stops with the EE at +0.022 m; a FAILURE
+            # burns all 25 replans and ends up at -0.021, i.e. digging into the
+            # table. So a failed grasp is not a near miss that needs more time,
+            # it is a stuck state that more time cannot fix -- the arm keeps
+            # re-planning from a pose no demonstration ever shows. Lifting back
+            # to travel height restores an in-distribution observation and lets
+            # the policy start the reach over.
+            if (
+                args.retry_after > 0
+                and diffik is not None
+                and retries < args.max_retries
+                and replans_since_retry >= args.retry_after
+                and max_lift_seen < 0.01
+            ):
+                cur_pos, _ = runtime.get_ee_pose_b(h, controller)
+                up = np.asarray(cur_pos, dtype=np.float64).copy()
+                up[2] = float(args.retry_height)
+                gripper = schema.GRIPPER_OPEN     # let go of whatever it is holding
+                latched = False
+                diffik.set_gripper(False)
+                for _ in range(int(args.retry_ticks)):
+                    diffik.step(up, quat_ref, render=False)
+                retries += 1
+                replans_since_retry = 0
+                if args.steer_to_box:
+                    commit_xy = box_xy_b          # re-commit to the commanded box
+                step += 1
+                imgs, state, ee_now = observe(gripper, save_to=frame_dir, tick=step)
+                obs_hist.append((imgs, state))
+                continue
+            replans_since_retry += 1
             obs = {
                 schema.camera_obs_key(cam): torch.stack([f[cam] for f, _ in obs_hist])
                 for cam in cfg.camera_names
@@ -421,7 +614,23 @@ def _run(args) -> int:
             if goal_vec is not None:
                 obs["goal"] = goal_vec
             cur_xy = obs["state"][-1, 0:2].numpy()
-            if args.expert:
+            if replay is not None:
+                # same act_horizon chunking the policy gets, so the executor sees
+                # an identically-shaped stream; the actions just come from disk
+                actions = replay_actions[step : step + cfg.act_horizon]
+                replans.append(
+                    {
+                        "step": step,
+                        "state": obs["state"].numpy(),
+                        "z": np.zeros((cfg.pred_horizon, cfg.action_dim), dtype=np.float32),
+                        "action_pred": np.repeat(
+                            actions[0:1], cfg.pred_horizon, axis=0
+                        ).astype(np.float32),
+                        "mode_lock_sel": np.int64(0),
+                        "commit_xy": box_xy_b.astype(np.float32),
+                    }
+                )
+            elif args.expert:
                 # one expert tick per policy tick, same cadence as act_horizon
                 pos_now, _ = runtime.get_ee_pose_b(h, controller)
                 tgt_abs, g_exp, expert_phase, expert_hold = expert_action(
@@ -453,7 +662,7 @@ def _run(args) -> int:
                 if args.mode_lock > 0:
                     pred0 = out["action_pred"][0].cpu().numpy()
                     commit_xy = cur_xy + pred0[:, 0:2].sum(axis=0)
-            if not args.expert:
+            if not args.expert and replay is None:
                 actions = out["action"][sel].cpu().numpy()  # (T_a, 7)
                 replans.append(
                     {
@@ -517,6 +726,11 @@ def _run(args) -> int:
                     # path got wrong.
                     if args.expert:
                         tgt_pos = expert_target_abs  # absolute, as collect_boxes does
+                    elif replay is not None and args.replay_mode == "abs":
+                        # the control arm: the demo's own recorded pose, absolute.
+                        # Identical inputs to the delta arm below -- this is the
+                        # ONE line that differs between them.
+                        tgt_pos = replay_pos_abs[step]
                     else:
                         cur_pos, _ = runtime.get_ee_pose_b(h, controller)
                         tgt_pos = np.asarray(cur_pos, dtype=np.float64) + np.asarray(a[0:3], dtype=np.float64)
@@ -531,6 +745,17 @@ def _run(args) -> int:
 
                 imgs, state, ee_now = observe(gripper, save_to=frame_dir, tick=step)
                 obs_hist.append((imgs, state))
+                if replay is not None:
+                    # `step` was incremented above, so the action just executed
+                    # was index step-1 and should have landed on replay_pos_abs[step-1]
+                    e = float(np.linalg.norm(np.asarray(ee_now, dtype=np.float64)
+                                             - replay_pos_abs[step - 1]))
+                    replay_err.append(e)
+                    if replay_close_err is None and gripper == schema.GRIPPER_CLOSE:
+                        replay_close_err = e
+                        replay_close_dist_xy = float(
+                            np.linalg.norm(np.asarray(ee_now[0:2]) - box_xy_b)
+                        )
                 for leaf, bxy in boxes_xy_b.items():
                     closest[leaf] = min(closest[leaf], float(np.linalg.norm(ee_now[0:2] - bxy)))
 
@@ -555,8 +780,12 @@ def _run(args) -> int:
                     success = True
                     if reached_leaf is None:
                         reached_leaf = max(lifts, key=lifts.get)
-                    break
-            if success:
+                    # a replay runs the demo to its end even after a lift is
+                    # detected, so the per-step error curve covers the whole
+                    # trajectory rather than stopping at the first success
+                    if replay is None:
+                        break
+            if success and replay is None:
                 break
 
         label = h.id_to_label.get(reached_leaf or "", "")
@@ -567,8 +796,28 @@ def _run(args) -> int:
                         "max_finger_rad": round(float(max_finger_rad), 4),
                         "max_box_move_m": round(float(max_box_move), 5),
                         "closest": {k: round(v, 4) for k, v in closest.items()}})
+        if replay is not None:
+            results[-1].update(
+                {
+                    "demo_episode": demo_ep,
+                    "replay_err_median_m": float(np.median(replay_err)) if replay_err else float("nan"),
+                    "replay_err_max_m": float(np.max(replay_err)) if replay_err else float("nan"),
+                    "replay_err_final_m": float(replay_err[-1]) if replay_err else float("nan"),
+                    "replay_close_err_m": replay_close_err,
+                    "replay_close_dist_xy_m": replay_close_dist_xy,
+                }
+            )
         cmd_str = f" commanded={commanded_leaf}" if commanded_leaf else ""
-        print(f"[ep {ep:03d}] success={success} reached={reached_leaf} ({label}){cmd_str} lift={max_lift_seen:.3f} boxmove={max_box_move:.4f} fingers={max_finger_rad:.2f} steps={step}")
+        rp_str = ""
+        if replay is not None:
+            r = results[-1]
+            rp_str = (
+                f" err_med={r['replay_err_median_m']*1000:.1f}mm"
+                f" err_max={r['replay_err_max_m']*1000:.1f}mm"
+                f" err_at_close={'n/a' if replay_close_err is None else f'{replay_close_err*1000:.1f}mm'}"
+                f" xy_to_box_at_close={'n/a' if replay_close_dist_xy is None else f'{replay_close_dist_xy*1000:.1f}mm'}"
+            )
+        print(f"[ep {ep:03d}] success={success} reached={reached_leaf} ({label}){cmd_str} lift={max_lift_seen:.3f} boxmove={max_box_move:.4f} fingers={max_finger_rad:.2f} steps={step} retries={retries}{rp_str}")
 
         np.savez_compressed(
             out_dir / f"episode_{ep:04d}.npz",
@@ -584,6 +833,12 @@ def _run(args) -> int:
             # world->base offset, so offline analysis can assign endpoints to boxes
             # exactly (E0 had to estimate this to +/-0.15m from behavior)
             scene_origin=np.asarray(h.scene_origins[0], dtype=np.float32),
+            replay_err=np.asarray(replay_err, dtype=np.float32),
+            replay_pos_abs=(
+                np.zeros((0, 3), dtype=np.float32)
+                if replay_pos_abs is None
+                else replay_pos_abs.astype(np.float32)
+            ),
             **{
                 f"replan{i:03d}_{key}": val
                 for i, r in enumerate(replans)
@@ -626,6 +881,24 @@ def _run(args) -> int:
         "ckpt": str(args.ckpt),
         "seed": args.seed,
     }
+    if replay is not None:
+        errs = [r["replay_err_median_m"] for r in results]
+        closes = [r["replay_close_err_m"] for r in results if r["replay_close_err_m"] is not None]
+        xys = [r["replay_close_dist_xy_m"] for r in results if r["replay_close_dist_xy_m"] is not None]
+        summary["replay"] = {
+            "mode": args.replay_mode,
+            "zarr": str(args.replay_demo),
+            "demo_episodes": [r["demo_episode"] for r in results],
+            "lifts": int(sum(r["success"] for r in results)),
+            "n": len(results),
+            # P0's refutation criterion: >=8/10 lifts AND median per-step error <5 mm
+            "per_step_err_median_m": float(np.median(errs)),
+            "per_step_err_p90_m": float(np.percentile([r["replay_err_max_m"] for r in results], 90)),
+            "per_step_err_worst_m": float(np.max([r["replay_err_max_m"] for r in results])),
+            "err_at_close_median_m": float(np.median(closes)) if closes else None,
+            "xy_to_target_at_close_median_m": float(np.median(xys)) if xys else None,
+            "episodes_that_closed": len(closes),
+        }
     if any(r["commanded"] for r in results):
         per_cmd: dict[str, dict[str, int]] = {}
         for r in results:

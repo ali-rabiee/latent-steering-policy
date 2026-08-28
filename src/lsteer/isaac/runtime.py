@@ -473,6 +473,18 @@ def make_diffik_driver(h: SimHandles, controller, ee_link: str = "j2n6s300_end_e
     return DiffIKDriver(h, controller, ee_link)
 
 
+def base_to_world_pos(h: SimHandles, pos_b) -> np.ndarray:
+    """Robot base frame -> world. Exact inverse of `world_to_base_pos`.
+
+    Needed to put a recorded demonstration's layout back on the table: the zarr
+    stores box positions in the BASE frame (`meta/episode_box_positions`, from
+    the logger's `pose_b`) while `teleport_box` takes world coordinates.
+    """
+    root = h.robot.data.root_pose_w
+    base_pos_w = root[0, 0:3].detach().cpu().numpy().astype(np.float64)
+    return np.asarray(pos_b, dtype=np.float64) + base_pos_w
+
+
 def world_to_base_pos(h: SimHandles, pos_w) -> np.ndarray:
     """World position -> robot base frame, the same transform collect_boxes uses.
 
