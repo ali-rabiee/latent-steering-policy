@@ -159,6 +159,21 @@ def main() -> int:
         "bound of inference-time steering; summary gains a per_command block.",
     )
     parser.add_argument(
+        "--exec-abs-target",
+        action="store_true",
+        help="P2a: accumulate the policy's deltas into a target anchored in SPACE "
+        "(tgt <- tgt + a[0:3] from the episode-start pose) instead of re-anchoring to the "
+        "arm every step (tgt = cur_pos + a[0:3]). P0 measured why this matters: replaying "
+        "a demonstration's own actions through the re-anchored path drifts a median "
+        "178.6 mm off the demonstrated trajectory and lifts 0/2, because the arm "
+        "over-executes each command by ~1.3-1.6x during fast travel and the next target "
+        "is measured from wherever it actually ended up, so the error is absorbed instead "
+        "of corrected. Driving the demo's absolute pose instead lifts 2/2 at 12-16 mm -- "
+        "and for a demonstration's own actions an accumulator IS that absolute pose, since "
+        "the actions are pose differences by construction (data/convert.py). Requires "
+        "--exec-diffik.",
+    )
+    parser.add_argument(
         "--replay-demo",
         type=Path,
         default=None,
@@ -258,6 +273,9 @@ def _run(args) -> int:
     provider = runtime.ChunkActionProvider(device=str(h.sim.device))
     controller.set_input_provider(provider)
     diffik = runtime.make_diffik_driver(h, controller) if args.exec_diffik else None
+    if args.exec_abs_target and diffik is None:
+        raise SystemExit("--exec-abs-target requires --exec-diffik")
+    print(f"executor: {'abs-target accumulator' if args.exec_abs_target else 'cur_pos + delta'}")
 
     n_phys = max(1, round((1.0 / schema.FPS) / h.dt))
     steps_per_episode = int(args.max_duration_s * schema.FPS)
@@ -597,6 +615,7 @@ def _run(args) -> int:
                 diffik.set_gripper(False)
                 for _ in range(int(args.retry_ticks)):
                     diffik.step(up, quat_ref, render=False)
+                tgt_pos = up  # a retract moves the arm: re-anchor the accumulator
                 retries += 1
                 replans_since_retry = 0
                 if args.steer_to_box:
@@ -726,6 +745,11 @@ def _run(args) -> int:
                     # path got wrong.
                     if args.expert:
                         tgt_pos = expert_target_abs  # absolute, as collect_boxes does
+                    elif args.exec_abs_target:
+                        # anchored in space: the target does NOT follow the arm, so
+                        # an over- or under-executed step is corrected on the next
+                        # one instead of becoming the new origin
+                        tgt_pos = tgt_pos + np.asarray(a[0:3], dtype=np.float64)
                     elif replay is not None and args.replay_mode == "abs":
                         # the control arm: the demo's own recorded pose, absolute.
                         # Identical inputs to the delta arm below -- this is the
