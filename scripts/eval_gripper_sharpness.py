@@ -48,7 +48,7 @@ def main() -> int:
     args = ap.parse_args()
 
     from lsteer.data import schema
-    from lsteer.data.dataset import DiffusionPolicyDataset
+    from lsteer.data.dataset import ZarrChunkDataset
     from lsteer.policy import DiffusionPolicy
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -57,7 +57,7 @@ def main() -> int:
     for ck in args.ckpts:
         policy = DiffusionPolicy.load(ck, device=device)
         cfg = policy.cfg
-        ds = DiffusionPolicyDataset(
+        ds = ZarrChunkDataset(
             str(args.zarr),
             obs_horizon=cfg.obs_horizon,
             pred_horizon=cfg.pred_horizon,
