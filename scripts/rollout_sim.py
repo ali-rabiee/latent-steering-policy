@@ -203,6 +203,22 @@ def main() -> int:
         "early-exit did not.",
     )
     parser.add_argument(
+        "--exec-ramp",
+        action="store_true",
+        help="P2d: interpolate the target smoothly from the window's starting pose to "
+        "pos_before + delta across the tick budget, instead of jumping to the endpoint and holding "
+        "it. MEASURED motivation (job 63737044, per-tick trace): fed a step, the arm reaches its "
+        "target at about 60%% of the window and then sails straight through at constant speed -- on "
+        "a 69.3 mm command it passes within 4.3 mm at tick 28 and ends 52.2 mm beyond. The "
+        "normalised response has the same shape at every step size and the overshoot grows with it "
+        "(gain 1.39 at 1.5 mm, 1.59 at 30.7 mm, 1.78 at 76.3 mm): an underdamped second-order "
+        "system driven by a step. The demonstrations never did that -- collect_boxes drives "
+        "QUINTIC-interpolated segments -- so this feeds the same smoothstep profile the data was "
+        "recorded under. Unlike --exec-converge and --exec-arrive-and-hold it changes WHAT is "
+        "commanded during the window rather than when the window ends, and it has no tolerance and "
+        "no dead zone.",
+    )
+    parser.add_argument(
         "--dump-ticks",
         type=int,
         default=0,
@@ -817,7 +833,22 @@ def _run(args) -> int:
                         cur_pos, _ = runtime.get_ee_pose_b(h, controller)
                         tgt_pos = np.asarray(cur_pos, dtype=np.float64) + np.asarray(a[0:3], dtype=np.float64)
                     diffik.set_gripper(gripper == schema.GRIPPER_CLOSE)
-                    if args.exec_arrive_and_hold:
+                    if args.exec_ramp:
+                        # smoothstep (quintic) from pos_before to tgt_pos across the window,
+                        # the same profile collect_boxes.py interpolates its segments with.
+                        # Same tick budget, so the control rate is unchanged.
+                        for j in range(n_phys):
+                            u = (j + 1) / n_phys
+                            w = u * u * u * (10.0 - 15.0 * u + 6.0 * u * u)  # 0->1, zero end slopes
+                            sub = pos_before + w * (tgt_pos - pos_before)
+                            render = ((j + 1) == n_phys) or ((j + 1) % render_stride == 0)
+                            diffik.step(sub, quat_ref, render=render)
+                            if args.dump_ticks and ep == 0 and len(tick_trace) < args.dump_ticks * n_phys:
+                                tick_trace.append(np.concatenate([
+                                    np.asarray(runtime.get_ee_pose_b(h, controller)[0], dtype=np.float64),
+                                    tgt_pos, pos_before, [float(step)]]))
+                        ticks_used.append(n_phys)
+                    elif args.exec_arrive_and_hold:
                         # Same tick budget as the baseline, so the control rate and the
                         # observation cadence are unchanged. The only difference is that
                         # the arm stops being pushed once it has covered the commanded
@@ -1040,6 +1071,7 @@ def _run(args) -> int:
         summary["executor"] = {
             "converge_tol_m": args.exec_converge,
             "arrive_and_hold": bool(args.exec_arrive_and_hold),
+            "ramp": bool(args.exec_ramp),
             "abs_target": bool(args.exec_abs_target),
             # asked to move d, the arm moves gain*d. 1.0 is faithful execution.
             "displacement_gain_median": round(float(np.median(_g)), 3),
