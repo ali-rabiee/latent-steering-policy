@@ -127,6 +127,7 @@ class Trainer:
             clip_sample=cfg.diffusion.clip_sample,
             goal_dim=schema.GOAL_DIM if cfg.data.goal_conditioned else 0,
             grip_loss_weight=cfg.optim.grip_loss_weight,
+            grip_head=cfg.optim.grip_head,
         )
         self.policy = DiffusionPolicy(policy_cfg).to(cfg.device)
         self.policy.schedule.to(cfg.device)
@@ -187,17 +188,27 @@ class Trainer:
             state_n = ema_policy.normalizer.normalize("state", batch["state"])
             cond = ema_policy._encode_obs(batch, state_n)
             z = torch.randn(
-                (cond.shape[0], ema_policy.cfg.pred_horizon, ema_policy.cfg.action_dim), device=device
+                (cond.shape[0], ema_policy.cfg.pred_horizon, ema_policy.diffusion_dim), device=device
             )
             x0 = ema_policy.sampler.sample(
                 lambda x, t: ema_policy.unet(x, t, cond), z.shape, z=z,
                 num_steps=ema_policy.cfg.num_inference_steps,
             )
+            if ema_policy.cfg.grip_head:
+                x0 = torch.cat([x0, torch.zeros_like(x0[..., :1])], dim=-1)
             pred = ema_policy.normalizer.unnormalize("action", x0)
             gt = batch["action"]
             pos_err.append(float(((pred[..., 0:3] - gt[..., 0:3]) ** 2).mean()))
             rot_err.append(float(((pred[..., 3:6] - gt[..., 3:6]) ** 2).mean()))
-            grip_err.append(float(((pred[..., 6:7] - gt[..., 6:7]) ** 2).mean()))
+            if ema_policy.cfg.grip_head:
+                # A2: the gripper is a classifier now, so MSE against +/-1 is the
+                # wrong readout. Report accuracy of the close decision instead --
+                # and remember it is only a screen: G0b showed NO on-distribution
+                # metric predicts closed-loop behaviour on this task.
+                closed = ema_policy.grip_head(cond) > 0.0
+                grip_err.append(float((closed == (gt[..., 6] < 0.0)).float().mean()))
+            else:
+                grip_err.append(float(((pred[..., 6:7] - gt[..., 6:7]) ** 2).mean()))
         return {
             "val/eps_mse": float(np.mean(eps_losses)),
             "val/action_pos_mse": float(np.mean(pos_err)),

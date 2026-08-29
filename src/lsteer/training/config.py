@@ -62,6 +62,10 @@ class OptimConfig:
     # E3: relative weight of the gripper channel in the denoising loss (see
     # PolicyConfig.grip_loss_weight)
     grip_loss_weight: float = 1.0
+    # A2: give the gripper its own classification head with a monotone
+    # commitment instead of diffusing it as a 7th regressed channel.
+    # See PolicyConfig.grip_head for the measurements behind it.
+    grip_head: bool = False
 
 
 @dataclass

@@ -48,6 +48,30 @@ class PolicyConfig:
     # demos are unambiguous, closing at EE height 0.047 m (p5 0.047, p95 0.048)
     # at the bottom of the descent, every one of 420 episodes.
     grip_loss_weight: float = 1.0
+    # A2: take the gripper OUT of the diffused action vector and give it its own
+    # head, trained as classification (BCE) on the conditioning alone, with a
+    # monotone "once closed, stays closed" commitment applied across the chunk.
+    #
+    # Why, measured. As one of 7 regressed channels the gripper is denoised from
+    # fresh noise at every replan, so it is re-decided independently each step and
+    # cannot represent a latch. In rollout the champion closes 6 times per
+    # successful episode and 17 times per failed one, first closing at 0.106 m,
+    # where every one of 420 demos closes exactly once at 0.047 m and never
+    # reopens. G0c then measured the consequence directly: median max finger
+    # closure is 0.929-0.939 rad for the scripted expert (stopped by the box
+    # between the fingers) and exactly 1.202 -- the travel limit, fully shut on
+    # nothing -- for the policy on all three seeds.
+    #
+    # G0d2 ruled out the alternative explanation: aiming the expert 8 mm off the
+    # box (the policy's own approach error) costs it NOTHING, 40/40, and 16 mm
+    # also costs nothing. Degradation only starts at 32 mm, where the expert's
+    # finger signature becomes 1.200 -- the policy's. So the gap is not where the
+    # arm is, it is when the hand closes.
+    #
+    # False keeps the original architecture exactly, so existing checkpoints
+    # (goalcond_v1, the champion) load and behave unchanged.
+    grip_head: bool = False
+    grip_head_hidden: int = 256
 
 
 class DiffusionPolicy(nn.Module):
@@ -61,9 +85,24 @@ class DiffusionPolicy(nn.Module):
             num_keypoints=cfg.num_keypoints,
             camera_names=cfg.camera_names,
         )
+        # A2: with a separate gripper head the U-Net diffuses only the 6 pose
+        # channels; the gripper is classified, not denoised.
+        self.diffusion_dim = cfg.action_dim - 1 if cfg.grip_head else cfg.action_dim
+        cond_dim = self.obs_encoder.out_dim + cfg.goal_dim
+        if cfg.grip_head:
+            # Deterministic in the observation: no diffusion noise enters the
+            # close decision at all, which is what removes the per-replan
+            # re-rolling that produces the flicker.
+            self.grip_head = nn.Sequential(
+                nn.Linear(cond_dim, cfg.grip_head_hidden),
+                nn.Mish(),
+                nn.Linear(cfg.grip_head_hidden, cfg.grip_head_hidden),
+                nn.Mish(),
+                nn.Linear(cfg.grip_head_hidden, cfg.pred_horizon),
+            )
         self.unet = ConditionalUnet1D(
-            input_dim=cfg.action_dim,
-            global_cond_dim=self.obs_encoder.out_dim + cfg.goal_dim,
+            input_dim=self.diffusion_dim,
+            global_cond_dim=cond_dim,
             diffusion_step_embed_dim=cfg.diffusion_step_embed_dim,
             down_dims=tuple(cfg.down_dims),
             kernel_size=cfg.kernel_size,
@@ -96,6 +135,22 @@ class DiffusionPolicy(nn.Module):
         state_n = self.normalizer.normalize("state", batch["state"])
         action_n = self.normalizer.normalize("action", batch["action"])
         cond = self._encode_obs(batch, state_n)
+
+        if self.cfg.grip_head:
+            # Diffuse the 6 pose channels only.
+            target_n = action_n[..., : self.diffusion_dim]
+            b = target_n.shape[0]
+            t = torch.randint(0, self.schedule.num_train_timesteps, (b,), device=target_n.device)
+            noise = torch.randn_like(target_n)
+            x_t = self.schedule.q_sample(target_n, t, noise)
+            eps_loss = F.mse_loss(self.unet(x_t, t, cond), noise)
+            # Gripper as classification. The demos encode open=+1 / close=-1, so
+            # "closed" is the negative half; BCE on that label is a far better
+            # match than MSE to a bimodal setpoint, and it is the loss that can
+            # express "this is the moment", which regression to +/-1 cannot.
+            grip_target = (batch["action"][..., 6] < 0.0).to(cond.dtype)  # (B, T_p)
+            grip_loss = F.binary_cross_entropy_with_logits(self.grip_head(cond), grip_target)
+            return eps_loss + self.cfg.grip_loss_weight * grip_loss
 
         b = action_n.shape[0]
         t = torch.randint(0, self.schedule.num_train_timesteps, (b,), device=action_n.device)
@@ -153,12 +208,13 @@ class DiffusionPolicy(nn.Module):
         cond = self._encode_obs(imgs, state_n)  # (1, C)
         cond_k = cond.expand(k, -1)
 
+        d = self.diffusion_dim
         if z is None:
-            z = torch.randn((k, cfg.pred_horizon, cfg.action_dim), generator=generator, device=device)
+            z = torch.randn((k, cfg.pred_horizon, d), generator=generator, device=device)
         else:
             z = z.to(device)
-            if z.shape != (k, cfg.pred_horizon, cfg.action_dim):
-                raise ValueError(f"z shape {tuple(z.shape)} != {(k, cfg.pred_horizon, cfg.action_dim)}")
+            if z.shape != (k, cfg.pred_horizon, d):
+                raise ValueError(f"z shape {tuple(z.shape)} != {(k, cfg.pred_horizon, d)}")
 
         x0 = self.sampler.sample(
             lambda x, t: self.unet(x, t, cond_k),
@@ -166,7 +222,25 @@ class DiffusionPolicy(nn.Module):
             z=z,
             num_steps=num_steps or cfg.num_inference_steps,
         )
+        if cfg.grip_head:
+            # Pad the gripper slot so the normalizer (fitted on all 7 channels)
+            # still applies; the placeholder is overwritten immediately below.
+            x0 = torch.cat([x0, torch.zeros_like(x0[..., :1])], dim=-1)
         action_pred = self.normalizer.unnormalize("action", x0)
+        if cfg.grip_head:
+            closed = (self.grip_head(cond_k) > 0.0)  # (k, T_p), logit > 0 == p > 0.5
+            # Monotone commitment ACROSS the chunk: once the head says close, it
+            # stays closed for the rest of the predicted horizon. This is the
+            # half of A2 that regression could not express at all -- the demos
+            # close exactly once and never reopen, and the champion reopens after
+            # its first close in 39 of 40 episodes.
+            closed = torch.cummax(closed.to(torch.uint8), dim=1).values.bool()
+            action_pred = action_pred.clone()
+            action_pred[..., 6] = torch.where(
+                closed,
+                torch.full_like(action_pred[..., 6], schema.GRIPPER_CLOSE),
+                torch.full_like(action_pred[..., 6], schema.GRIPPER_OPEN),
+            )
         start = cfg.obs_horizon - 1
         action = action_pred[:, start : start + cfg.act_horizon]
         return {"action": action, "action_pred": action_pred, "z": z}
