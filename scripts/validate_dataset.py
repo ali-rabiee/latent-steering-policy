@@ -111,6 +111,28 @@ def check_zarr(path: Path, action_tol: float = 2e-3, max_step: float = 0.09) -> 
             f"and carry {share:.0%} of the squared position error - these are almost certainly "
             "logging gaps, not motions, and training will spend that fraction of its budget on them")
 
+    # 2c. every episode starts where the others start
+    #
+    # R1's recovery data began each perturbed episode AT the off-course pose,
+    # mid-flight, instead of at home. Nothing here caught it: the actions were
+    # consistent, finite and in range, and every episode lifted. The model still
+    # came out closing the gripper at 0.247 m -- home height -- and never
+    # descending, because a demo set whose episodes start in scattered places no
+    # longer agrees on what "early in the reach" looks like. A recovery design
+    # is only safe if the episode stays continuous, so check the starts.
+    first = np.stack([state[int(s), 0:3] for s in starts])
+    home = np.median(first, axis=0)
+    off_home = np.linalg.norm(first - home, axis=1)
+    n_adrift = int((off_home > 0.05).sum())
+    ok_start = n_adrift == 0
+    print(f"  [{'PASS' if ok_start else 'FAIL'}] episodes start at the same home pose: "
+          f"{n_adrift} start >50 mm away (worst {off_home.max()*1000:.0f} mm)")
+    if not ok_start:
+        problems.append(
+            f"{n_adrift} episodes begin more than 50 mm from the common start pose - these are "
+            "fragments beginning mid-motion, not demonstrations, and they destroy the agreement "
+            "about how far through a reach the gripper should close")
+
     # 3. finite
     finite = bool(np.isfinite(state).all() and np.isfinite(action).all())
     print(f"  [{'PASS' if finite else 'FAIL'}] all values finite")
@@ -146,6 +168,58 @@ def check_zarr(path: Path, action_tol: float = 2e-3, max_step: float = 0.09) -> 
         f = np.asarray(frac_through)
         print(f"  [INFO] gripper closes {f.mean():.0%} of the way through the episode "
               f"(min {f.min():.0%}, max {f.max():.0%})")
+        lens = ends - starts
+        print(f"  [INFO] episode length: median {int(np.median(lens))} frames "
+              f"(min {int(lens.min())}, max {int(lens.max())}) - a recovery set is expected to be "
+              "bimodal, with the perturbed episodes longer")
+
+        # How tightly does height predict "how soon do I close"?
+        #
+        # This is the diagnostic that explains R1 rather than merely flagging it.
+        # Closing the gripper is a decision the policy has to read off the scene,
+        # and height is the strongest cue it has. In clean data every frame that
+        # sits N steps before the close is at nearly the same height, so the cue
+        # is unambiguous. R1's recovery episodes started up to 568 mm away yet
+        # still closed 60% of the way through, which taught "high and off course
+        # -> closing shortly" -- and the trained model duly closed at 0.247 m and
+        # never descended. Diversity of state is the POINT of recovery data, so
+        # this is reported, not failed: what matters is that the spread stays
+        # small close to the grasp, where the timing decision is actually made.
+        buckets: dict[int, list[float]] = {}
+        for e in range(n_ep):
+            s, t = int(starts[e]), int(ends[e])
+            g = action[s:t, 6]
+            closed = np.flatnonzero(g <= 0)
+            if not len(closed):
+                continue
+            c = int(closed[0])
+            for tt in range(max(0, c - 20), c):
+                buckets.setdefault(c - tt, []).append(float(state[s + tt, 2]))
+        cells = []
+        for d in (1, 2, 4, 8, 16):
+            v = np.asarray(buckets.get(d, []))
+            if len(v) < 10:
+                continue
+            spread = float(np.percentile(v, 90) - np.percentile(v, 10))
+            cells.append(f"d={d}: {np.median(v):.3f}m +/-{spread*1000:.0f}mm")
+        if cells:
+            print(f"  [INFO] EE height N frames before the gripper closes -- {', '.join(cells)}. "
+                  "A wide spread at small d means height no longer tells the policy when to close.")
+
+        # Is the vertical correction BALANCED?
+        #
+        # R2's knocks were upward only, so every recovery it ever demonstrated was
+        # a descent: 68% of travel-phase z-actions pointed down against 20% in the
+        # clean demos. The policy learned "correcting = go down" and drove a median
+        # 5 cm THROUGH the box, and the overshoot deepened with training (lowest EE
+        # z +0.020 at 20k, -0.004 at 60k) -- a directional prior, not a skill. A
+        # recovery set has to shove the arm both ways, so watch this number: near
+        # the clean baseline means balanced, far above it means biased downward.
+        travel = state[:, 2] > 0.20
+        if travel.sum() > 50:
+            share_down = float((action[travel, 2] < 0).mean())
+            print(f"  [INFO] travel-phase vertical corrections pointing DOWN: {share_down:.0%} "
+                  f"(clean demos are 20%; R2's biased set was 68% and over-descended by 5 cm)")
 
     print()
     if problems:
