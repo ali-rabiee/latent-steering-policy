@@ -630,20 +630,6 @@ def _run(args) -> int:
             commanded_leaf = leaves[ep % len(leaves)]
             origin0 = np.asarray(h.scene_origins[0], dtype=np.float32)
             box_xy_b = (layout_w[commanded_leaf] - origin0)[0:2].astype(np.float32)
-            if args.expert_xy_offset > 0.0:
-                # G0d: aim the expert at a point OFFSET from the true box, by a
-                # direction that is fixed for the episode and varies across
-                # episodes. This is the analogue of the policy's approach error:
-                # the expert reaches 0.5-0.8 mm from the box and lifts 120/120,
-                # the policy reaches 7-9 mm and lifts 45%. Sweeping the offset
-                # says how much lateral error the grasp actually tolerates, and
-                # therefore whether the policy's error is inside the basin.
-                # Success detection still uses the TRUE box, so this measures the
-                # grasp, not the metric.
-                _th = np.random.default_rng(args.seed * 100_000 + ep).uniform(0.0, 2.0 * np.pi)
-                box_xy_b = box_xy_b + np.array(
-                    [np.cos(_th), np.sin(_th)], dtype=np.float32
-                ) * np.float32(args.expert_xy_offset)
             # box top in the BASE frame, via the robot root pose (scene_origins
             # carries the env origin, whose z is not the table height)
             box_b = runtime.world_to_base_pos(h, layout_w[commanded_leaf])
@@ -684,6 +670,30 @@ def _run(args) -> int:
             commanded_leaf = leaves[ep % len(leaves)]
             origin0 = np.asarray(h.scene_origins[0], dtype=np.float32)
             box_xy_b = (layout_w[commanded_leaf] - origin0)[0:2].astype(np.float32)
+        if args.expert and args.expert_xy_offset > 0.0:
+            # G0d: aim the expert at a point OFFSET from the true box, in a
+            # direction fixed for the episode and varying across episodes, so the
+            # offset can be swept into a grasp-tolerance curve. Success detection
+            # still uses the TRUE box, so this perturbs the grasp, not the metric.
+            #
+            # THIS MUST STAY AFTER the goal-conditioning block above. The first
+            # attempt applied it inside `if args.expert:` and every cell of the
+            # sweep returned byte-identical numbers, because the champion is a
+            # goal-conditioned checkpoint and the `goal_dim > 0` branch reassigns
+            # box_xy_b from the true layout, silently undoing the offset. The flag
+            # had arrived and the output tags were right; the variable was
+            # overwritten downstream. Assert the offset survives.
+            _th = np.random.default_rng(args.seed * 100_000 + ep).uniform(0.0, 2.0 * np.pi)
+            _true_xy = box_xy_b.copy()
+            box_xy_b = box_xy_b + np.array(
+                [np.cos(_th), np.sin(_th)], dtype=np.float32
+            ) * np.float32(args.expert_xy_offset)
+            _applied = float(np.linalg.norm(box_xy_b - _true_xy))
+            assert abs(_applied - args.expert_xy_offset) < 1e-6, (
+                f"expert-xy-offset did not take: asked {args.expert_xy_offset}, applied {_applied}"
+            )
+            if ep == 0:
+                print(f"expert-xy-offset ACTIVE: {args.expert_xy_offset*1000:.1f} mm")
         if args.steer_to_box:
             if args.mode_lock <= 0:
                 raise SystemExit("--steer-to-box requires --mode-lock K")
