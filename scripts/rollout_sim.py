@@ -219,6 +219,19 @@ def main() -> int:
         "no dead zone.",
     )
     parser.add_argument(
+        "--expert-xy-offset",
+        type=float,
+        default=0.0,
+        metavar="METRES",
+        help="G0d: with --expert, aim the scripted expert at a point this far from the true box, in "
+        "a direction fixed per episode. MEASURED motivation: on the same three tables the expert "
+        "lifts 120/120 reaching a median 0.5-0.8 mm from the box, while the champion lifts 45% "
+        "reaching 7-9 mm. Sweeping this offset turns 'the grasp is marginal' into a tolerance curve "
+        "and says whether the policy's approach error is inside the basin or outside it -- which "
+        "decides whether the remaining gap is WHERE it grasps or WHEN it closes. Success detection "
+        "still uses the true box position, so this perturbs the grasp and not the metric.",
+    )
+    parser.add_argument(
         "--exec-gain-comp",
         type=float,
         default=0.0,
@@ -617,6 +630,20 @@ def _run(args) -> int:
             commanded_leaf = leaves[ep % len(leaves)]
             origin0 = np.asarray(h.scene_origins[0], dtype=np.float32)
             box_xy_b = (layout_w[commanded_leaf] - origin0)[0:2].astype(np.float32)
+            if args.expert_xy_offset > 0.0:
+                # G0d: aim the expert at a point OFFSET from the true box, by a
+                # direction that is fixed for the episode and varies across
+                # episodes. This is the analogue of the policy's approach error:
+                # the expert reaches 0.5-0.8 mm from the box and lifts 120/120,
+                # the policy reaches 7-9 mm and lifts 45%. Sweeping the offset
+                # says how much lateral error the grasp actually tolerates, and
+                # therefore whether the policy's error is inside the basin.
+                # Success detection still uses the TRUE box, so this measures the
+                # grasp, not the metric.
+                _th = np.random.default_rng(args.seed * 100_000 + ep).uniform(0.0, 2.0 * np.pi)
+                box_xy_b = box_xy_b + np.array(
+                    [np.cos(_th), np.sin(_th)], dtype=np.float32
+                ) * np.float32(args.expert_xy_offset)
             # box top in the BASE frame, via the robot root pose (scene_origins
             # carries the env origin, whose z is not the table height)
             box_b = runtime.world_to_base_pos(h, layout_w[commanded_leaf])
