@@ -203,6 +203,18 @@ def main() -> int:
         "early-exit did not.",
     )
     parser.add_argument(
+        "--dump-ticks",
+        type=int,
+        default=0,
+        metavar="N_ACTIONS",
+        help="characterise the executor: log the EE pose at EVERY physics tick for the first "
+        "N_ACTIONS of episode 0, into <out>/tick_trace.npz. Three fixes to the delta executor have "
+        "now failed (P2a accumulator 17.5%%, P2c converge 32.5%%, P2e arrive-and-hold gain 1.555) and "
+        "all three were designed against a GUESS about how the arm responds inside a 0.2 s action "
+        "window. This measures it instead: does the arm converge on a held target, how fast, does it "
+        "overshoot, and what is the steady-state error.",
+    )
+    parser.add_argument(
         "--converge-max-ticks",
         type=int,
         default=0,
@@ -624,6 +636,7 @@ def _run(args) -> int:
         # how far the arm ended from the target it was GIVEN, what it was asked to
         # travel, what it actually travelled, and how many ticks that took
         tgt_err: list[float] = []
+        tick_trace: list = []
         cmd_mm: list[float] = []
         ach_mm: list[float] = []
         ticks_used: list[int] = []
@@ -846,6 +859,13 @@ def _run(args) -> int:
                         for j in range(n_phys):
                             render = ((j + 1) == n_phys) or ((j + 1) % render_stride == 0)
                             diffik.step(tgt_pos, quat_ref, render=render)
+                            if args.dump_ticks and ep == 0 and len(tick_trace) < args.dump_ticks * n_phys:
+                                tick_trace.append(
+                                    np.concatenate([
+                                        np.asarray(runtime.get_ee_pose_b(h, controller)[0], dtype=np.float64),
+                                        tgt_pos, pos_before, [float(step)],
+                                    ])
+                                )
                         ticks_used.append(n_phys)
                     # how far the arm ended from the target it was actually given.
                     # Large => the window ends mid-flight and the next target is set
@@ -966,6 +986,8 @@ def _run(args) -> int:
             # exactly (E0 had to estimate this to +/-0.15m from behavior)
             scene_origin=np.asarray(h.scene_origins[0], dtype=np.float32),
             replay_err=np.asarray(replay_err, dtype=np.float32),
+            tick_trace=(np.asarray(tick_trace, dtype=np.float32) if tick_trace
+                        else np.zeros((0, 10), dtype=np.float32)),
             replay_pos_abs=(
                 np.zeros((0, 3), dtype=np.float32)
                 if replay_pos_abs is None
