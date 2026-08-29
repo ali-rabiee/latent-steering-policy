@@ -188,6 +188,21 @@ def main() -> int:
         "pose that is still in motion. 0 = off. Requires --exec-diffik.",
     )
     parser.add_argument(
+        "--exec-arrive-and-hold",
+        action="store_true",
+        help="P2e: keep the FULL n_phys window, but once the arm has travelled the distance it "
+        "was commanded, freeze the target at the pose it reached and hold there for the rest of "
+        "the window. Fixes both defects found so far. (1) The overshoot: P2c measured that the arm "
+        "needs 15 of its 48 ticks to arrive and spends the other 33 coasting past, giving a 1.5x "
+        "displacement gain. (2) The dead zone --exec-converge introduced: its fixed 8 mm tolerance "
+        "is larger than 22.6%% of the policy's own commanded steps and 35.7%% of the demos', so "
+        "those actions counted as 'already arrived' before the arm moved and got one tick instead "
+        "of 48 -- gain fell to 0.692 and champion success to 32.5%%. Stopping on DISTANCE TRAVELLED "
+        "is scale-free: a 2 mm command stops after 2 mm. Holding for the rest of the window keeps "
+        "the 5 Hz control rate and the observation cadence identical to the baseline, which "
+        "early-exit did not.",
+    )
+    parser.add_argument(
         "--converge-max-ticks",
         type=int,
         default=0,
@@ -789,7 +804,26 @@ def _run(args) -> int:
                         cur_pos, _ = runtime.get_ee_pose_b(h, controller)
                         tgt_pos = np.asarray(cur_pos, dtype=np.float64) + np.asarray(a[0:3], dtype=np.float64)
                     diffik.set_gripper(gripper == schema.GRIPPER_CLOSE)
-                    if args.exec_converge > 0.0:
+                    if args.exec_arrive_and_hold:
+                        # Same tick budget as the baseline, so the control rate and the
+                        # observation cadence are unchanged. The only difference is that
+                        # the arm stops being pushed once it has covered the commanded
+                        # distance, instead of coasting on toward a target it has passed.
+                        want = float(np.linalg.norm(np.asarray(a[0:3], dtype=np.float64)))
+                        frozen = None
+                        for j in range(n_phys):
+                            if frozen is None:
+                                p_now = np.asarray(
+                                    runtime.get_ee_pose_b(h, controller)[0], dtype=np.float64
+                                )
+                                if float(np.linalg.norm(p_now - pos_before)) >= want:
+                                    frozen = p_now  # arrived: hold here
+                            render = ((j + 1) == n_phys) or ((j + 1) % render_stride == 0)
+                            diffik.step(
+                                tgt_pos if frozen is None else frozen, quat_ref, render=render
+                            )
+                        ticks_used.append(n_phys)
+                    elif args.exec_converge > 0.0:
                         # Stop when the arm ARRIVES, the way collect_boxes drove every
                         # segment, instead of when a tick counter runs out. Always take
                         # at least one step, and render the last one so the next
@@ -983,6 +1017,7 @@ def _run(args) -> int:
     if _g:
         summary["executor"] = {
             "converge_tol_m": args.exec_converge,
+            "arrive_and_hold": bool(args.exec_arrive_and_hold),
             "abs_target": bool(args.exec_abs_target),
             # asked to move d, the arm moves gain*d. 1.0 is faithful execution.
             "displacement_gain_median": round(float(np.median(_g)), 3),
