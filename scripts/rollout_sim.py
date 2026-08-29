@@ -219,6 +219,25 @@ def main() -> int:
         "no dead zone.",
     )
     parser.add_argument(
+        "--exec-gain-comp",
+        type=float,
+        default=0.0,
+        metavar="GAIN",
+        help="A0: divide the commanded position delta by GAIN before forming the target, to cancel "
+        "the executor's steady-state displacement gain. MEASURED motivation: with --exec-ramp the "
+        "champion's own summary.json reports displacement_gain_median 0.833, i.e. the arm delivers "
+        "83%% of every delta it is asked for, every action -- and rollout_sim re-reads the MEASURED "
+        "pose before each action, so this is a stable multiplicative shortfall rather than a drift. "
+        "The demonstrations were recorded where commanded == achieved, so a policy trained on them "
+        "is asking for a displacement it does not get. Same argument as --exec-ramp (execute the "
+        "action the way the data was recorded), applied to amplitude instead of profile. Unlike "
+        "P2a/P2c/P2e this changes neither the reference frame nor when the window ends -- only the "
+        "commanded amplitude. Pass 0 to disable. CHECK FIRST that the ramped gain is flat in "
+        "amplitude (cmd_mm/ach_mm are now in every episode npz): the PRE-ramp gain ran 1.39->1.78 "
+        "with step size, and if the ramped one also varies then a single scalar is the wrong shape "
+        "of correction.",
+    )
+    parser.add_argument(
         "--dump-ticks",
         type=int,
         default=0,
@@ -339,7 +358,14 @@ def _run(args) -> int:
     diffik = runtime.make_diffik_driver(h, controller) if args.exec_diffik else None
     if args.exec_abs_target and diffik is None:
         raise SystemExit("--exec-abs-target requires --exec-diffik")
-    print(f"executor: {'abs-target accumulator' if args.exec_abs_target else 'cur_pos + delta'}")
+    # printed so a null result can be traced to the flag actually firing: slurm/ is
+    # gitignored, and two experiments have already run as silent no-ops because a
+    # --close-* flag never reached the cluster's sbatch.
+    print(
+        f"executor: {'abs-target accumulator' if args.exec_abs_target else 'cur_pos + delta'}"
+        f" | ramp={bool(args.exec_ramp)}"
+        f" | gain_comp={args.exec_gain_comp if args.exec_gain_comp > 0 else 'off'}"
+    )
 
     n_phys = max(1, round((1.0 / schema.FPS) / h.dt))
     steps_per_episode = int(args.max_duration_s * schema.FPS)
@@ -831,7 +857,16 @@ def _run(args) -> int:
                         tgt_pos = replay_pos_abs[step]
                     else:
                         cur_pos, _ = runtime.get_ee_pose_b(h, controller)
-                        tgt_pos = np.asarray(cur_pos, dtype=np.float64) + np.asarray(a[0:3], dtype=np.float64)
+                        # A0: the arm delivers `gain` x the commanded delta (0.833 with
+                        # the ramp), so ask for delta/gain to land on the delta the
+                        # policy actually predicted. Direction is untouched; only the
+                        # amplitude changes. cmd_mm below still records the ORIGINAL
+                        # commanded magnitude, so the reported gain stays comparable
+                        # across runs with and without the flag.
+                        _d = np.asarray(a[0:3], dtype=np.float64)
+                        if args.exec_gain_comp > 0.0:
+                            _d = _d / args.exec_gain_comp
+                        tgt_pos = np.asarray(cur_pos, dtype=np.float64) + _d
                     diffik.set_gripper(gripper == schema.GRIPPER_CLOSE)
                     if args.exec_ramp:
                         # smoothstep (quintic) from pos_before to tgt_pos across the window,
@@ -1017,6 +1052,13 @@ def _run(args) -> int:
             # exactly (E0 had to estimate this to +/-0.15m from behavior)
             scene_origin=np.asarray(h.scene_origins[0], dtype=np.float32),
             replay_err=np.asarray(replay_err, dtype=np.float32),
+            # A0: per-action commanded vs achieved displacement magnitude. These
+            # were already computed for the summary's single median gain figure and
+            # then thrown away; keeping them makes the gain-vs-AMPLITUDE curve
+            # available offline from any rollout, which is what decides whether a
+            # scalar gain compensation is the right shape of correction at all.
+            cmd_mm=np.asarray(cmd_mm, dtype=np.float32),
+            ach_mm=np.asarray(ach_mm, dtype=np.float32),
             tick_trace=(np.asarray(tick_trace, dtype=np.float32) if tick_trace
                         else np.zeros((0, 10), dtype=np.float32)),
             replay_pos_abs=(
