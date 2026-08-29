@@ -174,6 +174,27 @@ def main() -> int:
         "--exec-diffik.",
     )
     parser.add_argument(
+        "--exec-converge",
+        type=float,
+        default=0.0,
+        metavar="TOL_M",
+        help="P2c: drive each target until the EE is within TOL of it, instead of for a fixed "
+        "n_phys ticks. Measured motivation: replaying a demo's own actions, achieved displacement "
+        "over a replan window divided by commanded displacement has a median of 1.43 (1.62, 1.47, "
+        "1.39, 0.81, 4.29, 0.94, 2.17) -- asked to move d, the arm moves 1.43 d. The demonstrations "
+        "were recorded by a controller that CONVERGED to each waypoint "
+        "(collect_boxes.py::_run_segment, 8 mm tolerance), while this loop spends a fixed tick "
+        "budget and moves on whether or not the arm arrived, so the next target is measured from a "
+        "pose that is still in motion. 0 = off. Requires --exec-diffik.",
+    )
+    parser.add_argument(
+        "--converge-max-ticks",
+        type=int,
+        default=0,
+        help="tick cap per action for --exec-converge (default: 3x n_phys). A cap is required or a "
+        "target the arm cannot reach would stall the episode forever.",
+    )
+    parser.add_argument(
         "--replay-demo",
         type=Path,
         default=None,
@@ -584,6 +605,13 @@ def _run(args) -> int:
         step = 0
         retries = 0
         replans_since_retry = 0
+        # executor diagnostics, recorded on every action regardless of mode:
+        # how far the arm ended from the target it was GIVEN, what it was asked to
+        # travel, what it actually travelled, and how many ticks that took
+        tgt_err: list[float] = []
+        cmd_mm: list[float] = []
+        ach_mm: list[float] = []
+        ticks_used: list[int] = []
         # per-step |achieved EE - demo EE| and the error at the gripper close
         replay_err: list[float] = []
         replay_close_err = replay_close_dist_xy = None
@@ -743,6 +771,8 @@ def _run(args) -> int:
                     # Position stays relative because the policy emits deltas;
                     # only ORIENTATION is held absolutely, which is what the twist
                     # path got wrong.
+                    pos_before, _ = runtime.get_ee_pose_b(h, controller)
+                    pos_before = np.asarray(pos_before, dtype=np.float64)
                     if args.expert:
                         tgt_pos = expert_target_abs  # absolute, as collect_boxes does
                     elif args.exec_abs_target:
@@ -759,9 +789,37 @@ def _run(args) -> int:
                         cur_pos, _ = runtime.get_ee_pose_b(h, controller)
                         tgt_pos = np.asarray(cur_pos, dtype=np.float64) + np.asarray(a[0:3], dtype=np.float64)
                     diffik.set_gripper(gripper == schema.GRIPPER_CLOSE)
-                    for j in range(n_phys):
-                        render = ((j + 1) == n_phys) or ((j + 1) % render_stride == 0)
-                        diffik.step(tgt_pos, quat_ref, render=render)
+                    if args.exec_converge > 0.0:
+                        # Stop when the arm ARRIVES, the way collect_boxes drove every
+                        # segment, instead of when a tick counter runs out. Always take
+                        # at least one step, and render the last one so the next
+                        # observe() sees a fresh frame.
+                        cap = int(args.converge_max_ticks) or (3 * n_phys)
+                        j = 0
+                        while j < cap:
+                            j += 1
+                            pos_now, _ = runtime.get_ee_pose_b(h, controller)
+                            arrived = (
+                                float(np.linalg.norm(np.asarray(pos_now, dtype=np.float64) - tgt_pos))
+                                <= args.exec_converge
+                            )
+                            render = arrived or (j == cap) or (j % render_stride == 0)
+                            diffik.step(tgt_pos, quat_ref, render=render)
+                            if arrived:
+                                break
+                        ticks_used.append(j)
+                    else:
+                        for j in range(n_phys):
+                            render = ((j + 1) == n_phys) or ((j + 1) % render_stride == 0)
+                            diffik.step(tgt_pos, quat_ref, render=render)
+                        ticks_used.append(n_phys)
+                    # how far the arm ended from the target it was actually given.
+                    # Large => the window ends mid-flight and the next target is set
+                    # from a moving pose; ~0 => the gain comes from somewhere else.
+                    _p = np.asarray(runtime.get_ee_pose_b(h, controller)[0], dtype=np.float64)
+                    tgt_err.append(float(np.linalg.norm(_p - tgt_pos)))
+                    cmd_mm.append(float(np.linalg.norm(np.asarray(a[0:3], dtype=np.float64))))
+                    ach_mm.append(float(np.linalg.norm(_p - pos_before)))
                 else:
                     provider.set_step(a[0:3], a[3:6], gripper, n_phys)
                     run_phys_steps(n_phys)
@@ -831,7 +889,23 @@ def _run(args) -> int:
                     "replay_close_dist_xy_m": replay_close_dist_xy,
                 }
             )
+        # displacement gain, over the actions that actually asked for real motion
+        # (below ~5 mm the ratio is dominated by settling noise, not by tracking)
+        big = [(c, g) for c, g in zip(cmd_mm, ach_mm) if c > 0.005]
+        gain = float(np.median([g / c for c, g in big])) if big else float("nan")
+        results[-1].update(
+            {
+                "gain_median": round(gain, 3),
+                "tgt_err_median_m": round(float(np.median(tgt_err)), 5) if tgt_err else None,
+                "ticks_median": float(np.median(ticks_used)) if ticks_used else None,
+            }
+        )
         cmd_str = f" commanded={commanded_leaf}" if commanded_leaf else ""
+        ex_str = (
+            f" gain={gain:.2f} tgt_err={np.median(tgt_err)*1000:.1f}mm ticks={np.median(ticks_used):.0f}"
+            if tgt_err
+            else ""
+        )
         rp_str = ""
         if replay is not None:
             r = results[-1]
@@ -841,7 +915,7 @@ def _run(args) -> int:
                 f" err_at_close={'n/a' if replay_close_err is None else f'{replay_close_err*1000:.1f}mm'}"
                 f" xy_to_box_at_close={'n/a' if replay_close_dist_xy is None else f'{replay_close_dist_xy*1000:.1f}mm'}"
             )
-        print(f"[ep {ep:03d}] success={success} reached={reached_leaf} ({label}){cmd_str} lift={max_lift_seen:.3f} boxmove={max_box_move:.4f} fingers={max_finger_rad:.2f} steps={step} retries={retries}{rp_str}")
+        print(f"[ep {ep:03d}] success={success} reached={reached_leaf} ({label}){cmd_str} lift={max_lift_seen:.3f} boxmove={max_box_move:.4f} fingers={max_finger_rad:.2f} steps={step} retries={retries}{ex_str}{rp_str}")
 
         np.savez_compressed(
             out_dir / f"episode_{ep:04d}.npz",
@@ -905,6 +979,22 @@ def _run(args) -> int:
         "ckpt": str(args.ckpt),
         "seed": args.seed,
     }
+    _g = [r["gain_median"] for r in results if r.get("gain_median") == r.get("gain_median")]
+    if _g:
+        summary["executor"] = {
+            "converge_tol_m": args.exec_converge,
+            "abs_target": bool(args.exec_abs_target),
+            # asked to move d, the arm moves gain*d. 1.0 is faithful execution.
+            "displacement_gain_median": round(float(np.median(_g)), 3),
+            # how far the arm ends from the target it was given; large means the
+            # action window closes while the arm is still in flight
+            "target_err_median_m": round(
+                float(np.median([r["tgt_err_median_m"] for r in results if r.get("tgt_err_median_m") is not None])), 5
+            ),
+            "ticks_per_action_median": float(
+                np.median([r["ticks_median"] for r in results if r.get("ticks_median") is not None])
+            ),
+        }
     if replay is not None:
         errs = [r["replay_err_median_m"] for r in results]
         closes = [r["replay_close_err_m"] for r in results if r["replay_close_err_m"] is not None]
