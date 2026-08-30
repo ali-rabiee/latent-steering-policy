@@ -251,6 +251,18 @@ def main() -> int:
         "of correction.",
     )
     parser.add_argument(
+        "--exec-abs-max-step",
+        type=float,
+        default=0.0,
+        metavar="METRES",
+        help="A1b: with --absolute-actions checkpoints, clip the implied motion (target - current) to this "
+        "magnitude. Measured motivation: the absolute policy reaches 112 mm from the commanded box by replan 3 "
+        "and then diverges back to 306 mm, burning all 25 replans, where the delta champion converges to 12 mm. "
+        "Off the demonstrated phase an absolute model falls back to a specific workspace pose and drives to it; "
+        "a delta model falls back to ~0 and stops. The expert's own peak single-step motion is 78.2 mm, so "
+        "anything larger is off-distribution by construction. 0 disables.",
+    )
+    parser.add_argument(
         "--exec-gain-comp-slope",
         type=float,
         default=0.0,
@@ -942,6 +954,22 @@ def _run(args) -> int:
                             _d = np.asarray(a[0:3], dtype=np.float64) - np.asarray(
                                 cur_pos, dtype=np.float64
                             )
+                            # A1b: bound the implied motion to the expert's own peak
+                            # single-step displacement. MEASURED motivation: with
+                            # absolute targets the arm closes to 112 mm of the
+                            # commanded box by replan 3 and then DIVERGES, ending at
+                            # 306 mm - roughly where it started - while burning all
+                            # 25 replans. A delta model's off-distribution fallback is
+                            # a small delta ("stay put"); an absolute model's is a
+                            # specific place in the workspace, so it drives there. The
+                            # demos never move more than 78.2 mm in one step, so any
+                            # implied motion past that is off-distribution by
+                            # construction and can be clipped without touching
+                            # anything the demonstrations actually do.
+                            if args.exec_abs_max_step > 0.0:
+                                _n = float(np.linalg.norm(_d))
+                                if _n > args.exec_abs_max_step:
+                                    _d = _d * (args.exec_abs_max_step / _n)
                         else:
                             _d = np.asarray(a[0:3], dtype=np.float64)
                         _d_cmd = _d.copy()  # commanded motion, BEFORE compensation
