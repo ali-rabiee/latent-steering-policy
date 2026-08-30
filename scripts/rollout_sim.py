@@ -821,14 +821,25 @@ def _run(args) -> int:
                 # sample K fresh candidates and stay loyal to the commitment
                 out = policy.predict_action(obs, k=args.mode_lock, generator=g_ep)
                 preds = out["action_pred"].cpu().numpy()  # (K, T_p, 7)
-                ends = cur_xy[None] + preds[:, :, 0:2].sum(axis=1)
+                # A1: with ABSOLUTE targets the chunk's endpoint is simply its last
+                # predicted pose. Summing them, which is right for deltas, is
+                # meaningless for absolute poses -- it adds up positions. Getting
+                # this wrong fed mode-lock a nonsense selection criterion and
+                # collapsed commanded-box obedience to 0.0-0.9 (run A1_60k, void).
+                if getattr(cfg, "absolute_actions", False):
+                    ends = preds[:, -1, 0:2]
+                else:
+                    ends = cur_xy[None] + preds[:, :, 0:2].sum(axis=1)
                 sel = int(np.argmin(np.linalg.norm(ends - commit_xy[None], axis=1)))
             else:
                 out = policy.predict_action(obs, z=z_ep, k=1)  # z held fixed for the episode
                 sel = 0
                 if args.mode_lock > 0:
                     pred0 = out["action_pred"][0].cpu().numpy()
-                    commit_xy = cur_xy + pred0[:, 0:2].sum(axis=0)
+                    if getattr(cfg, "absolute_actions", False):
+                        commit_xy = pred0[-1, 0:2]
+                    else:
+                        commit_xy = cur_xy + pred0[:, 0:2].sum(axis=0)
             if not args.expert and replay is None:
                 actions = out["action"][sel].cpu().numpy()  # (T_a, 7)
                 replans.append(
@@ -893,6 +904,13 @@ def _run(args) -> int:
                     # path got wrong.
                     pos_before, _ = runtime.get_ee_pose_b(h, controller)
                     pos_before = np.asarray(pos_before, dtype=np.float64)
+                    # Default for the expert / replay / abs-target branches, which do
+                    # not go through the policy path below: a[0:3] is a displacement
+                    # in all of them, exactly as it always was, so the reported gain
+                    # stays comparable with every historical run. The policy path
+                    # overwrites this (identically in delta mode; with the implied
+                    # motion in A1's absolute mode).
+                    _d_cmd = np.asarray(a[0:3], dtype=np.float64)
                     if args.expert:
                         tgt_pos = expert_target_abs  # absolute, as collect_boxes does
                     elif args.exec_abs_target:
@@ -926,6 +944,7 @@ def _run(args) -> int:
                             )
                         else:
                             _d = np.asarray(a[0:3], dtype=np.float64)
+                        _d_cmd = _d.copy()  # commanded motion, BEFORE compensation
                         if args.exec_gain_comp > 0.0:
                             # A0b: the executor's gain is not constant in amplitude.
                             # Measured on A0gain's successful episodes, the RAW gain
@@ -1014,7 +1033,10 @@ def _run(args) -> int:
                     # from a moving pose; ~0 => the gain comes from somewhere else.
                     _p = np.asarray(runtime.get_ee_pose_b(h, controller)[0], dtype=np.float64)
                     tgt_err.append(float(np.linalg.norm(_p - tgt_pos)))
-                    cmd_mm.append(float(np.linalg.norm(np.asarray(a[0:3], dtype=np.float64))))
+                    # A1: for absolute targets |a[0:3]| is a POSITION, not a
+                    # displacement, so the gain must be measured against the motion
+                    # the action actually implies. _d is that motion in both modes.
+                    cmd_mm.append(float(np.linalg.norm(_d_cmd)))
                     ach_mm.append(float(np.linalg.norm(_p - pos_before)))
                 else:
                     provider.set_step(a[0:3], a[3:6], gripper, n_phys)
