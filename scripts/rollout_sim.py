@@ -602,7 +602,7 @@ def _run(args) -> int:
         grip = schema.GRIPPER_OPEN if phase in ("align", "descend") else schema.GRIPPER_CLOSE
         return capped, grip, phase, hold
 
-    def expert_action_stateless(pos_b, box_xy, grip_now, hold):
+    def expert_action_stateless(pos_b, box_xy, box_held, hold):
         """A4: the same expert, but with its phase DERIVED from the current pose
         and gripper instead of carried forward from its own past.
 
@@ -622,8 +622,15 @@ def _run(args) -> int:
         pos = np.asarray(pos_b, dtype=np.float64)
         xy_err = float(np.linalg.norm(pos[0:2] - np.asarray(box_xy, dtype=np.float64)))
 
-        if grip_now == schema.GRIPPER_CLOSE:
-            # already holding: go up. Keep holding while the fingers settle.
+        if box_held:
+            # genuinely holding the box -- judged from the WORLD (the box has
+            # actually risen), never from the gripper command. That distinction is
+            # the whole point: the pilot showed that keying on the gripper made
+            # the relabeller inherit the policy's mistake, labelling "close" at a
+            # median 0.111 m where the demos close at 0.047, because a policy that
+            # had wrongly shut in mid-air looked to it like a successful grasp.
+            # Reading the box instead means a premature close is labelled
+            # "open and descend", which is the correction DAgger exists to supply.
             tgt = np.array([box_xy[0], box_xy[1], lift_z], dtype=np.float64)
             hold += 1
             return _rate_limit(pos, tgt), schema.GRIPPER_CLOSE, hold
@@ -650,13 +657,16 @@ def _run(args) -> int:
         """
         out = np.zeros((horizon, 7), dtype=np.float32)
         p = np.asarray(pos0, dtype=np.float64)
-        g, hold = grip0, 0
+        held, hold = bool(grip0), 0
         for k in range(horizon):
-            tgt, g_next, hold = expert_action_stateless(p, box_xy, g, hold)
+            tgt, g_next, hold = expert_action_stateless(p, box_xy, held, hold)
+            # rolling forward, a close AT grasp height means the box is now held
+            if g_next == schema.GRIPPER_CLOSE:
+                held = True
             out[k, 0:3] = (np.asarray(tgt, dtype=np.float64) - p).astype(np.float32)
             out[k, 3:6] = 0.0  # orientation: the demos vary by ~0 and diff-IK pins it
             out[k, 6] = g_next
-            p, g = np.asarray(tgt, dtype=np.float64), g_next
+            p = np.asarray(tgt, dtype=np.float64)
         return out
 
     def _rate_limit(pos, tgt):
@@ -910,10 +920,15 @@ def _run(args) -> int:
                     # The gripper is genuine OBSERVED state -- it is channel 9 of
                     # the state vector the policy itself sees -- so deriving the
                     # phase from it is not the hidden phase counter coming back.
-                    tgt_abs, g_exp, expert_hold = expert_action_stateless(
-                        pos_now, box_xy_b, expert_grip, expert_hold
+                    _snap = runtime.box_snapshot(h)
+                    _held = bool(
+                        commanded_leaf in _snap
+                        and commanded_leaf in boxes0
+                        and (_snap[commanded_leaf][2] - boxes0[commanded_leaf][2]) > 0.01
                     )
-                    expert_grip = g_exp
+                    tgt_abs, g_exp, expert_hold = expert_action_stateless(
+                        pos_now, box_xy_b, _held, expert_hold
+                    )
                 else:
                     tgt_abs, g_exp, expert_phase, expert_hold = expert_action(
                         pos_now, box_xy_b, expert_phase, expert_hold
@@ -979,7 +994,13 @@ def _run(args) -> int:
                     # label must use it, or the two describe different robots.
                     _di, _ds, _dp = observe(gripper, save_to=dag_ep_dir, tick=len(dag_states))
                     dag_states.append(_ds.numpy().astype(np.float32))
-                    dag_actions.append(expert_chunk(_dp, box_xy_b, gripper, 1)[0])
+                    _snap = runtime.box_snapshot(h)
+                    _held = bool(
+                        commanded_leaf in _snap
+                        and commanded_leaf in boxes0
+                        and (_snap[commanded_leaf][2] - boxes0[commanded_leaf][2]) > 0.01
+                    )
+                    dag_actions.append(expert_chunk(_dp, box_xy_b, _held, 1)[0])
                 if args.hold_orientation:
                     _, quat_now = runtime.get_ee_pose_b(h, controller)
                     a = a.copy()
