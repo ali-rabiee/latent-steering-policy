@@ -251,6 +251,18 @@ def main() -> int:
         "of correction.",
     )
     parser.add_argument(
+        "--exec-gain-comp-slope",
+        type=float,
+        default=0.0,
+        metavar="PER_MM",
+        help="A0b: make the gain compensation AFFINE in commanded amplitude, c(a) = GAIN + SLOPE*a_mm, "
+        "clamped to [0.60, 1.00]. MEASURED motivation: on A0gain's successful episodes the raw executor gain "
+        "falls from 0.838 at a 7.5 mm command to 0.741 at 52 mm (fit: 0.8386 - 0.001316*a_mm), so a single "
+        "scalar under-compensates long steps. Long steps are the reaches to the FAR boxes, and that is exactly "
+        "where seed 1 fails: purple ends 21.1 mm out, past the 16 mm grasp basin G0d2 measured, with coverage "
+        "6.9%%. Pass 0 to keep the constant compensation.",
+    )
+    parser.add_argument(
         "--dump-ticks",
         type=int,
         default=0,
@@ -902,7 +914,21 @@ def _run(args) -> int:
                         # across runs with and without the flag.
                         _d = np.asarray(a[0:3], dtype=np.float64)
                         if args.exec_gain_comp > 0.0:
-                            _d = _d / args.exec_gain_comp
+                            # A0b: the executor's gain is not constant in amplitude.
+                            # Measured on A0gain's successful episodes, the RAW gain
+                            # falls from 0.838 at a 7.5 mm command to 0.741 at 52 mm,
+                            # so one scalar over-compensates short steps and
+                            # UNDER-compensates long ones - and the long ones are
+                            # exactly the reaches to the far boxes, which is where
+                            # seed 1 fails (purple at 21.1 mm, outside the 16 mm
+                            # grasp basin, coverage 6.9%). An affine c(a) tracks it.
+                            _c = args.exec_gain_comp
+                            if args.exec_gain_comp_slope != 0.0:
+                                _amp_mm = float(np.linalg.norm(_d)) * 1000.0
+                                _c = float(
+                                    np.clip(_c + args.exec_gain_comp_slope * _amp_mm, 0.60, 1.00)
+                                )
+                            _d = _d / _c
                         tgt_pos = np.asarray(cur_pos, dtype=np.float64) + _d
                     diffik.set_gripper(gripper == schema.GRIPPER_CLOSE)
                     if args.exec_ramp:
