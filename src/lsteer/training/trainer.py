@@ -88,6 +88,7 @@ class Trainer:
             crop_size=cfg.data.crop,
             camera_names=tuple(cfg.data.camera_names) or None,
             goal_conditioned=cfg.data.goal_conditioned,
+            absolute_actions=cfg.data.absolute_actions,
         )
         self.train_set = ZarrChunkDataset(cfg.data.zarr_path, episode_ids=self.train_eps, train=True, **common)
         self.val_set = (
@@ -128,6 +129,7 @@ class Trainer:
             goal_dim=schema.GOAL_DIM if cfg.data.goal_conditioned else 0,
             grip_loss_weight=cfg.optim.grip_loss_weight,
             grip_head=cfg.optim.grip_head,
+            absolute_actions=cfg.data.absolute_actions,
         )
         self.policy = DiffusionPolicy(policy_cfg).to(cfg.device)
         self.policy.schedule.to(cfg.device)

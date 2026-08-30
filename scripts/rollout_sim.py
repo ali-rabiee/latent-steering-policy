@@ -390,6 +390,7 @@ def _run(args) -> int:
         f"executor: {'abs-target accumulator' if args.exec_abs_target else 'cur_pos + delta'}"
         f" | ramp={bool(args.exec_ramp)}"
         f" | gain_comp={args.exec_gain_comp if args.exec_gain_comp > 0 else 'off'}"
+        f" | actions={'ABSOLUTE' if getattr(cfg, 'absolute_actions', False) else 'delta'}"
     )
 
     n_phys = max(1, round((1.0 / schema.FPS) / h.dt))
@@ -912,7 +913,19 @@ def _run(args) -> int:
                         # amplitude changes. cmd_mm below still records the ORIGINAL
                         # commanded magnitude, so the reported gain stays comparable
                         # across runs with and without the flag.
-                        _d = np.asarray(a[0:3], dtype=np.float64)
+                        # A1: with an absolute-pose policy the action IS the target,
+                        # so the implied motion is (target - where we are). Everything
+                        # downstream - gain compensation, the ramp - then applies
+                        # unchanged to that motion. This is the whole point of the
+                        # representation: a delta re-baselines on wherever the arm
+                        # actually got to, while an absolute target is re-aimed at the
+                        # same place every step and so corrects its own shortfall.
+                        if getattr(cfg, "absolute_actions", False):
+                            _d = np.asarray(a[0:3], dtype=np.float64) - np.asarray(
+                                cur_pos, dtype=np.float64
+                            )
+                        else:
+                            _d = np.asarray(a[0:3], dtype=np.float64)
                         if args.exec_gain_comp > 0.0:
                             # A0b: the executor's gain is not constant in amplitude.
                             # Measured on A0gain's successful episodes, the RAW gain

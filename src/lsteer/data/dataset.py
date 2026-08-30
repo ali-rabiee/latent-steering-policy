@@ -83,6 +83,7 @@ class ZarrChunkDataset(Dataset):
         train: bool = True,
         camera_names=None,
         goal_conditioned: bool = False,
+        absolute_actions: bool = False,
     ):
         import zarr
 
@@ -109,6 +110,27 @@ class ZarrChunkDataset(Dataset):
         # low-dim fields fully in RAM; images stay lazy in zarr (1-frame chunks)
         self.state = np.asarray(self.root[schema.DATA_STATE])
         self.action = np.asarray(self.root[schema.DATA_ACTION])
+        # A1: replace the DELTA position target with the ABSOLUTE pose it points
+        # at. Exact, and needs no re-conversion: convert.py builds the action as
+        # a_t = pose_{t+1} - pose_t from consecutive logged poses, and state[t]
+        # holds pose_t, so state[t] + action[t] IS pose_{t+1}. Rotation stays a
+        # delta (diff-IK pins the wrist; orientation variance across all 420
+        # demos is ~0) and the gripper is untouched.
+        #
+        # Motivation, measured in closed loop this phase: making the executor
+        # strictly more faithful REDISTRIBUTED reach error between boxes without
+        # reducing it (A0b), so the residual belongs to the policy's commanded
+        # trajectory. An absolute target is self-correcting - the policy names
+        # where to go rather than how far to move.
+        #
+        # Known cost, measured before training: absolute poses span
+        # [0.384, 0.599, 0.210] m against the deltas' [0.086, 0.126, 0.138], and
+        # the normalizer is per-dimension min-max, so the same normalized error
+        # costs ~4.5x more millimetres in x and y. A1 has to beat that.
+        self.absolute_actions = absolute_actions
+        if absolute_actions:
+            self.action = self.action.copy()
+            self.action[:, 0:3] = self.state[:, 0:3] + self.action[:, 0:3]
         missing = [c for c in self.camera_names if schema.camera_img_key(c) not in self.root]
         if missing:
             raise KeyError(

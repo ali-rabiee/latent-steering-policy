@@ -32,6 +32,9 @@ class DataConfig:
     num_workers: int = 4
     # E2: condition on the recorded per-episode target (colour one-hot + xy)
     goal_conditioned: bool = False
+    # A1: emit absolute EE pose targets instead of deltas (see
+    # ZarrChunkDataset.absolute_actions for the measurement behind it)
+    absolute_actions: bool = False
 
 
 @dataclass

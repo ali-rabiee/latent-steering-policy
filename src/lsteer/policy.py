@@ -72,6 +72,10 @@ class PolicyConfig:
     # (goalcond_v1, the champion) load and behave unchanged.
     grip_head: bool = False
     grip_head_hidden: int = 256
+    # A1: the position channels of the action are an ABSOLUTE EE pose in the
+    # base frame rather than a delta. Recorded here so rollout_sim can drive
+    # the target directly off the checkpoint instead of being told by a flag.
+    absolute_actions: bool = False
 
 
 class DiffusionPolicy(nn.Module):
