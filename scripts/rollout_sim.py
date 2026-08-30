@@ -219,6 +219,14 @@ def main() -> int:
         "no dead zone.",
     )
     parser.add_argument(
+        "--expert-stateless",
+        action="store_true",
+        help="A4: derive the expert's phase from the current pose and gripper instead of carrying it forward. "
+        "Required for DAgger relabelling -- the carried phase machine reflects the EXPERT's own history, which "
+        "never happened in a policy rollout, so it cannot answer 'what would the expert do from HERE'. Validate "
+        "it against the stateful expert's 120/120 before trusting it as a relabeller.",
+    )
+    parser.add_argument(
         "--expert-xy-offset",
         type=float,
         default=0.0,
@@ -581,6 +589,49 @@ def _run(args) -> int:
         grip = schema.GRIPPER_OPEN if phase in ("align", "descend") else schema.GRIPPER_CLOSE
         return capped, grip, phase, hold
 
+    def expert_action_stateless(pos_b, box_xy, grip_now, hold):
+        """A4: the same expert, but with its phase DERIVED from the current pose
+        and gripper instead of carried forward from its own past.
+
+        DAgger needs the action the expert would take at a state the POLICY
+        reached, and the carried phase machine cannot answer that -- its phase
+        reflects the expert's own history, which never happened in a policy
+        rollout. Deriving the phase from the observation is what makes the
+        expert usable as a relabeller.
+
+        The derivation mirrors the stateful machine exactly: closed gripper
+        means the grasp is done and the job is to lift; otherwise align in xy
+        while high, then descend, then close.
+        """
+        home_z = float(home_pose_z)
+        grasp_z = box_top_z + EXPERT_EE_Z_OFFSET + EXPERT_GRASP_DEPTH
+        lift_z = box_top_z + EXPERT_EE_Z_OFFSET + EXPERT_TRAVEL_H
+        pos = np.asarray(pos_b, dtype=np.float64)
+        xy_err = float(np.linalg.norm(pos[0:2] - np.asarray(box_xy, dtype=np.float64)))
+
+        if grip_now == schema.GRIPPER_CLOSE:
+            # already holding: go up. Keep holding while the fingers settle.
+            tgt = np.array([box_xy[0], box_xy[1], lift_z], dtype=np.float64)
+            hold += 1
+            return _rate_limit(pos, tgt), schema.GRIPPER_CLOSE, hold
+        if xy_err > EXPERT_TOL_ALIGN_M:
+            # not over the box yet: line up at travel height, fingers open
+            tgt = np.array([box_xy[0], box_xy[1], home_z], dtype=np.float64)
+            return _rate_limit(pos, tgt), schema.GRIPPER_OPEN, hold
+        if pos[2] > grasp_z + EXPERT_TOL_DESCEND_M:
+            tgt = np.array([box_xy[0], box_xy[1], grasp_z], dtype=np.float64)
+            return _rate_limit(pos, tgt), schema.GRIPPER_OPEN, hold
+        # over the box and at grasp height: close
+        tgt = np.array([box_xy[0], box_xy[1], grasp_z], dtype=np.float64)
+        return tgt, schema.GRIPPER_CLOSE, hold + 1
+
+    def _rate_limit(pos, tgt):
+        err = tgt - pos
+        n = float(np.linalg.norm(err))
+        if n <= EXPERT_STEP_M:
+            return tgt
+        return pos + err * (EXPERT_STEP_M / max(n, 1e-9))
+
     home_pose_z = 0.248  # replaced with the measured home pose below
     box_top_z = 0.036   # replaced per episode from the actual box
 
@@ -660,6 +711,7 @@ def _run(args) -> int:
             box_b = runtime.world_to_base_pos(h, layout_w[commanded_leaf])
             box_top_z = float(box_b[2]) + 0.5 * float(args.box_size)
             expert_phase, expert_hold = "align", 0
+            expert_grip = schema.GRIPPER_OPEN  # A4: observed gripper for the stateless expert
             home_pose_z = float(runtime.get_ee_pose_b(h, controller)[0][2])
         replay_actions = replay_pos_abs = None
         if replay is not None:
@@ -812,9 +864,18 @@ def _run(args) -> int:
             elif args.expert:
                 # one expert tick per policy tick, same cadence as act_horizon
                 pos_now, _ = runtime.get_ee_pose_b(h, controller)
-                tgt_abs, g_exp, expert_phase, expert_hold = expert_action(
-                    pos_now, box_xy_b, expert_phase, expert_hold
-                )
+                if args.expert_stateless:
+                    # The gripper is genuine OBSERVED state -- it is channel 9 of
+                    # the state vector the policy itself sees -- so deriving the
+                    # phase from it is not the hidden phase counter coming back.
+                    tgt_abs, g_exp, expert_hold = expert_action_stateless(
+                        pos_now, box_xy_b, expert_grip, expert_hold
+                    )
+                    expert_grip = g_exp
+                else:
+                    tgt_abs, g_exp, expert_phase, expert_hold = expert_action(
+                        pos_now, box_xy_b, expert_phase, expert_hold
+                    )
                 expert_target_abs = np.asarray(tgt_abs, dtype=np.float64)
                 actions = np.zeros((1, 7), dtype=np.float32)
                 actions[0, 0:3] = expert_target_abs - np.asarray(pos_now, dtype=np.float64)
