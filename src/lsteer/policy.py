@@ -161,11 +161,21 @@ class DiffusionPolicy(nn.Module):
         noise = torch.randn_like(action_n)
         x_t = self.schedule.q_sample(action_n, t, noise)
         pred = self.unet(x_t, t, cond)
+        # A4b: per-frame gripper weight. Frames whose gripper label is not
+        # trustworthy (DAgger relabels) contribute their POSITION error and
+        # nothing else. Without this, A4's 6533 relabelled frames - 95% of them
+        # "open", and sitting right at the close threshold - collapsed the policy
+        # to never closing at all, at 3.75% success with the best reach the
+        # project has ever measured.
+        gm = batch.get("grip_mask")
+        w = torch.ones_like(pred)
         if self.cfg.grip_loss_weight != 1.0:
-            w = torch.ones(self.cfg.action_dim, device=pred.device, dtype=pred.dtype)
-            w[6] = self.cfg.grip_loss_weight
-            return (w * (pred - noise) ** 2).mean()
-        return F.mse_loss(pred, noise)
+            w[..., 6] = self.cfg.grip_loss_weight
+        if gm is not None:
+            w[..., 6] = w[..., 6] * gm.to(pred.dtype)
+        if gm is None and self.cfg.grip_loss_weight == 1.0:
+            return F.mse_loss(pred, noise)
+        return (w * (pred - noise) ** 2).sum() / w.sum().clamp_min(1.0)
 
     # ------------------------------------------------------------ inference
     @torch.no_grad()

@@ -51,6 +51,10 @@ def camera_obs_key(name: str) -> str:
 DATA_STATE = "data/state"
 DATA_ACTION = "data/action"
 DATA_JOINTS = "data/joints"
+# A4b: per-frame weight on the GRIPPER channel of the loss. 1 for frames whose
+# gripper label is trustworthy (demonstrations), 0 for frames that supervise
+# position only (DAgger relabels). Absent in older zarrs, which default to 1.
+DATA_GRIP_MASK = "data/grip_mask"
 META_EPISODE_ENDS = "meta/episode_ends"
 META_EPISODE_SUCCESS = "meta/episode_success"
 META_EPISODE_ATTEMPTS = "meta/episode_attempts"

@@ -127,6 +127,13 @@ class ZarrChunkDataset(Dataset):
         # [0.384, 0.599, 0.210] m against the deltas' [0.086, 0.126, 0.138], and
         # the normalizer is per-dimension min-max, so the same normalized error
         # costs ~4.5x more millimetres in x and y. A1 has to beat that.
+        # A4b: per-frame gripper-loss weight. Older zarrs have no such array and
+        # default to 1, so every existing dataset behaves exactly as before.
+        self.grip_mask = (
+            np.asarray(self.root[schema.DATA_GRIP_MASK], dtype=np.float32)
+            if schema.DATA_GRIP_MASK in self.root
+            else np.ones(len(self.action), dtype=np.float32)
+        )
         self.absolute_actions = absolute_actions
         if absolute_actions:
             self.action = self.action.copy()
@@ -191,9 +198,13 @@ class ZarrChunkDataset(Dataset):
             for w in range(self.obs_horizon)
         ]
 
+        gmask = sample_sequence(
+            self.grip_mask, self.pred_horizon, buffer_start, buffer_end, sample_start, sample_end
+        )
         out = {
             "state": torch.from_numpy(np.ascontiguousarray(state)),
             "action": torch.from_numpy(np.ascontiguousarray(action)),
+            "grip_mask": torch.from_numpy(np.ascontiguousarray(gmask)),
         }
         if self.goal_conditioned:
             # buffer_start is always inside the source episode (padding only

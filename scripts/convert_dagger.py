@@ -50,6 +50,8 @@ def main():
     ap.add_argument("--merge-zarr", default="", help="existing zarr to prepend (e.g. boxes_v0)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--max-episodes", type=int, default=0)
+    ap.add_argument("--mask-dagger-gripper", action="store_true",
+                    help="A4b: zero the gripper loss on DAgger frames, keeping their position supervision")
     args = ap.parse_args()
     import zarr
 
@@ -66,7 +68,7 @@ def main():
                 break
     print(f"loaded {len(eps)} DAgger episodes, {sum(len(e['state']) for e in eps)} frames")
 
-    states, actions, ends = [], [], []
+    states, actions, ends, gmask = [], [], [], []
     tpos, tcol, bpos, bcol, succ = [], [], [], [], []
     img_stacks = {c: [] for c in cams}
     total = 0
@@ -76,6 +78,7 @@ def main():
         s0 = np.asarray(src[schema.DATA_STATE]); a0 = np.asarray(src[schema.DATA_ACTION])
         e0 = np.asarray(src[schema.META_EPISODE_ENDS])
         states.append(s0); actions.append(a0)
+        gmask.append(np.ones(len(s0), dtype=np.float32))  # demos supervise the gripper
         ends.extend(e0.tolist()); total = int(e0[-1])
         for c in cams:
             img_stacks[c].append(np.asarray(src[schema.camera_img_key(c)]))
@@ -88,6 +91,13 @@ def main():
 
     for e in eps:
         states.append(e["state"]); actions.append(e["action"])
+        # A4b: DAgger frames supervise POSITION only. Their gripper labels are
+        # sparse (~5% closed against the demos' 41%) and sit right at the close
+        # threshold, so including them collapsed the policy to never closing:
+        # A4 scored 3.75% with a best-in-project 1.50 mm reach and a max finger
+        # closure of 0.005. Where to go and when to close are learned from
+        # different sources.
+        gmask.append(np.full(len(e["state"]), 0.0 if args.mask_dagger_gripper else 1.0, dtype=np.float32))
         total += len(e["state"]); ends.append(total)
         for c in cams:
             img_stacks[c].append(e["imgs"][c])
@@ -108,6 +118,7 @@ def main():
     root.create_dataset(schema.META_BOX_POSITIONS, data=np.concatenate(bpos), dtype="f4")
     root.create_dataset(schema.META_BOX_COLORS, data=np.concatenate(bcol), dtype="i8")
     root.create_dataset(schema.META_EPISODE_SUCCESS, data=np.concatenate(succ), dtype="i8")
+    root.create_dataset(schema.DATA_GRIP_MASK, data=np.concatenate(gmask), dtype="f4")
     root.attrs["camera_names"] = cams
     root.attrs["dagger_episodes"] = len(eps)
     print(f"WROTE {args.out}: {len(ends)} episodes, {total} frames "
