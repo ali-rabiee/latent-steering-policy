@@ -50,6 +50,9 @@ def main():
     ap.add_argument("--merge-zarr", default="", help="existing zarr to prepend (e.g. boxes_v0)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--max-episodes", type=int, default=0)
+    ap.add_argument("--grip-supervise-below", type=float, default=0.0, metavar="METRES",
+                    help="A4c: supervise the gripper only on DAgger frames whose EE height is below this, "
+                         "masking it above. Overrides --mask-dagger-gripper.")
     ap.add_argument("--mask-dagger-gripper", action="store_true",
                     help="A4b: zero the gripper loss on DAgger frames, keeping their position supervision")
     args = ap.parse_args()
@@ -97,7 +100,21 @@ def main():
         # A4 scored 3.75% with a best-in-project 1.50 mm reach and a max finger
         # closure of 0.005. Where to go and when to close are learned from
         # different sources.
-        gmask.append(np.full(len(e["state"]), 0.0 if args.mask_dagger_gripper else 1.0, dtype=np.float32))
+        if args.grip_supervise_below > 0.0:
+            # A4c: supervise the gripper on the DAgger frames NEAR THE GRASP and
+            # mask it elsewhere. Measured on dagger_v3: the close rate among
+            # DAgger frames is 4.8% overall but 9.3% below 0.12 m and 12.8% below
+            # 0.06 m, because almost every high frame is trivially "open". The
+            # near-grasp band is where the label carries information -- and it
+            # covers 0.093-0.102 m, exactly where A4b's FAILURES wrongly close and
+            # where the expert says "still open, descend". A4b's successes close
+            # at 0.071-0.075 m against the demos' 0.047, so the residual really is
+            # timing, and this is the only signal that addresses it in the states
+            # the policy actually reaches.
+            gm = (np.asarray(e["state"])[:, 2] < args.grip_supervise_below).astype(np.float32)
+        else:
+            gm = np.full(len(e["state"]), 0.0 if args.mask_dagger_gripper else 1.0, dtype=np.float32)
+        gmask.append(gm)
         total += len(e["state"]); ends.append(total)
         for c in cams:
             img_stacks[c].append(e["imgs"][c])
