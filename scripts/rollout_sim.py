@@ -272,6 +272,15 @@ def main() -> int:
         "of correction.",
     )
     parser.add_argument(
+        "--exec-act-horizon",
+        type=int,
+        default=0,
+        metavar="N",
+        help="A5: execute only the first N actions of each predicted chunk before re-planning, instead of the "
+        "trained act_horizon of 4. The scripted expert re-observes after every single action and reaches 1.2 mm "
+        "laterally at the moment it closes; the policy goes 4 actions blind and closes at 10-22 mm. 0 = off.",
+    )
+    parser.add_argument(
         "--exec-abs-max-step",
         type=float,
         default=0.0,
@@ -972,6 +981,22 @@ def _run(args) -> int:
                         commit_xy = cur_xy + pred0[:, 0:2].sum(axis=0)
             if not args.expert and replay is None:
                 actions = out["action"][sel].cpu().numpy()  # (T_a, 7)
+                if args.exec_act_horizon > 0:
+                    # A5: execute fewer of the predicted actions before re-planning.
+                    # MEASURED motivation: the scripted expert re-observes after
+                    # EVERY action (its chunk is length 1) and lifts 120/120 at a
+                    # 1.2 mm lateral error; the policy executes 4 blind actions
+                    # between observations and closes at 10-22 mm. During the
+                    # descent, 4 actions is ~8 cm of unobserved motion, and the
+                    # failures' own numbers say alignment is achieved high
+                    # (2.7 mm at z=0.20) and LOST on the way down. This is the one
+                    # structural difference between the 100% expert and the 70%
+                    # policy that has never been tested.
+                    #
+                    # NOTE it changes the observation cadence, not the control
+                    # rate: every action still gets its full tick budget, unlike
+                    # P2c's early exit which silently ran the arm at 3x speed.
+                    actions = actions[: args.exec_act_horizon]
                 replans.append(
                     {
                         "step": step,
