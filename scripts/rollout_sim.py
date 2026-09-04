@@ -281,6 +281,21 @@ def main() -> int:
         "laterally at the moment it closes; the policy goes 4 actions blind and closes at 10-22 mm. 0 = off.",
     )
     parser.add_argument(
+        "--exec-grip-lookahead",
+        type=int,
+        default=0,
+        metavar="L",
+        help="A6: let the gripper see past the position horizon. MEASURED motivation: shortening "
+        "--exec-act-horizon drives lateral error from 4.0 mm to 1.3 mm and success from 69% DOWN to "
+        "22.5% - aim and success move in OPPOSITE directions, so the close, not the position, is the "
+        "binding constraint. The reason truncation destroys the grasp is that the model emits a "
+        "SCHEDULE ('close at chunk index k'); executing only the first N steps never reaches index k, "
+        "so the hand never shuts. This reads the gripper channel from the UNTRUNCATED chunk and closes "
+        "if the model intends to close within the next L steps, turning that schedule back into a "
+        "decision. Only ever flips OPEN -> CLOSE, and only on the model's own prediction. "
+        "0 = off (gripper stays tied to the truncated chunk).",
+    )
+    parser.add_argument(
         "--exec-abs-max-step",
         type=float,
         default=0.0,
@@ -433,6 +448,8 @@ def _run(args) -> int:
         f" | ramp={bool(args.exec_ramp)}"
         f" | gain_comp={args.exec_gain_comp if args.exec_gain_comp > 0 else 'off'}"
         f" | actions={'ABSOLUTE' if getattr(cfg, 'absolute_actions', False) else 'delta'}"
+        f" | act_horizon={args.exec_act_horizon if args.exec_act_horizon > 0 else 'full'}"
+        f" | grip_lookahead={args.exec_grip_lookahead if args.exec_grip_lookahead > 0 else 'off'}"
     )
 
     n_phys = max(1, round((1.0 / schema.FPS) / h.dt))
@@ -759,6 +776,7 @@ def _run(args) -> int:
         max_finger_rad = 0.0  # how far the fingers actually close (target 1.2)
         max_box_move = 0.0    # 3-D box displacement: 0 means the fingers never touched it
         latched = False
+        grip_full = None  # A6: untruncated gripper schedule (expert/replay never set it)
         commit_xy = None  # E1 mode-lock: xy endpoint committed at the first replan
         commanded_leaf = None
         goal_vec = None
@@ -981,6 +999,7 @@ def _run(args) -> int:
                         commit_xy = cur_xy + pred0[:, 0:2].sum(axis=0)
             if not args.expert and replay is None:
                 actions = out["action"][sel].cpu().numpy()  # (T_a, 7)
+                grip_full = None
                 if args.exec_act_horizon > 0:
                     # A5: execute fewer of the predicted actions before re-planning.
                     # MEASURED motivation: the scripted expert re-observes after
@@ -996,6 +1015,11 @@ def _run(args) -> int:
                     # NOTE it changes the observation cadence, not the control
                     # rate: every action still gets its full tick budget, unlike
                     # P2c's early exit which silently ran the arm at 3x speed.
+                    if args.exec_grip_lookahead > 0:
+                        # A6: keep the WHOLE schedule's gripper channel. Captured
+                        # before the slice, so index i here is the same instant as
+                        # index i in the truncated position chunk.
+                        grip_full = actions[:, 6].copy()
                     actions = actions[: args.exec_act_horizon]
                 replans.append(
                     {
@@ -1008,7 +1032,7 @@ def _run(args) -> int:
                     }
                 )
 
-            for a in actions:
+            for _ai, a in enumerate(actions):
                 if dagger_dir is not None:
                     # A4: log the state the POLICY reached, paired with the action
                     # the EXPERT would take from it. Captured BEFORE the policy's
@@ -1036,6 +1060,10 @@ def _run(args) -> int:
                         a = a.copy()
                         a[2] = max(0.0, float(args.clamp_height - pos_now[2]))
                 g_cmd = schema.GRIPPER_OPEN if a[6] > 0.0 else schema.GRIPPER_CLOSE
+                if grip_full is not None and g_cmd == schema.GRIPPER_OPEN:
+                    _hi = min(len(grip_full), _ai + 1 + args.exec_grip_lookahead)
+                    if bool(np.any(grip_full[_ai:_hi] <= 0.0)):
+                        g_cmd = schema.GRIPPER_CLOSE
                 if g_cmd == schema.GRIPPER_CLOSE and (
                     (args.close_on_arrival > 0.0 and commanded_leaf is not None)
                     or args.close_max_height > 0.0
