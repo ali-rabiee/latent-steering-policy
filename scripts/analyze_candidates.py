@@ -28,6 +28,8 @@ import numpy as np
 BAND = (0.045, 0.12)
 XY_TOL = 0.016
 DZ_TOL = 0.010
+GRIP_IDX = 9          # schema.STATE_DIM == 10; the gripper is the last channel
+GRASP_Z = 0.070       # "got into grasp territory" -- the close happens at ~0.055
 
 
 def main() -> None:
@@ -112,6 +114,77 @@ def main() -> None:
     print("f(xy)   = same, ignoring z entirely")
     print("rank    = median position of the best good candidate under the CURRENT score (0 = already chosen)")
     print("best dxy / best dz / chosen dz in mm, medians over in-band replans")
+
+    path_table(args)
+
+
+def path_table(args) -> None:
+    """The corrected reading: score the PATH, not the endpoint, before the grasp.
+
+    The preregistered table above is confounded and its own numbers show why. It
+    filtered on the arm ALREADY being in the 0.045-0.12 m band, which on a
+    succeeding cell is mostly the post-grasp LIFT -- so "the endpoint ascends by
+    178 mm" is the model correctly proposing to lift the box it just grabbed. And
+    on Obj_01 the arm reaches that band 17 times in 40 episodes, so the
+    preregistered population barely exists on the cell the phase is about.
+
+    The question the run was bought to answer is asked here instead: while the
+    gripper is still OPEN, does any candidate's PATH dip to grasp height over the
+    commanded box? A chunk that descends to the box and lifts away again has an
+    endpoint in mid-air; only the path shows the descent.
+    """
+    per_box: dict[str, dict] = {}
+    for run in args.dirs:
+        for f in sorted(run.glob("episode_*.npz")):
+            d = np.load(f, allow_pickle=True)
+            cmd = str(d["commanded_id"])
+            org = np.asarray(d["scene_origin"], dtype=np.float64)
+            box_xy = (np.asarray(d["commanded_pos_w"], dtype=np.float64) - org)[0:2]
+            b = per_box.setdefault(
+                cmd, {"eps": 0, "succ": 0, "open": 0, "desc": 0, "ranks": [],
+                      "minz": [], "dxy_at_min": [], "chosen_minz": []})
+            b["eps"] += 1
+            b["succ"] += int(bool(d["success"]))
+            for k in sorted(x for x in d.files if x.endswith("_cands")):
+                pre = k[: -len("_cands")]
+                st = np.asarray(d[f"{pre}_state"])[-1]
+                if float(st[GRIP_IDX]) <= 0.0:      # already closed: this is the lift
+                    continue
+                b["open"] += 1
+                cur = st[0:3].astype(np.float64)
+                c = np.asarray(d[k], dtype=np.float64)              # (K, T, 7)
+                zs = cur[2] + np.cumsum(c[:, :, 2], axis=1)          # (K, T)
+                xy = cur[0:2][None, None] + np.cumsum(c[:, :, 0:2], axis=1)
+                t = np.argmin(zs, axis=1)                            # deepest step
+                minz = zs[np.arange(len(zs)), t]
+                dxy = np.linalg.norm(xy[np.arange(len(xy)), t] - box_xy[None], axis=1)
+                desc = (minz <= GRASP_Z) & (dxy <= args.xy_tol)
+                score = np.asarray(d[f"{pre}_cand_score"], dtype=np.float64)
+                sel = int(np.argmin(score))
+                b["minz"].append(float(minz.min()))
+                b["dxy_at_min"].append(float(dxy.min()))
+                b["chosen_minz"].append(float(minz[sel]))
+                if desc.any():
+                    b["desc"] += 1
+                    b["ranks"].append(int(np.argmax(desc[np.argsort(score)])))
+
+    print(f"\n\n=== CORRECTED: path, not endpoint, while the gripper is still OPEN ===")
+    print(f"descent candidate = path dips to <= {GRASP_Z*1000:.0f} mm with its deepest point "
+          f"within {args.xy_tol*1000:.0f} mm of the commanded box\n")
+    hdr = (f"{'box':<9}{'eps':>5}{'succ':>7}{'open rp':>9}{'f(desc)':>9}{'rank':>7}"
+           f"{'best minz':>11}{'chosen minz':>13}{'best dxy@min':>14}")
+    print(hdr); print("-" * len(hdr))
+    for cmd in sorted(per_box, key=lambda c: -per_box[c]["succ"] / max(per_box[c]["eps"], 1)):
+        b = per_box[cmd]
+        o = b["open"]
+        print(f"{cmd.rsplit('/',1)[-1]:<9}{b['eps']:>5}{100*b['succ']/b['eps']:>6.1f}%{o:>9}"
+              f"{b['desc']/o if o else float('nan'):>9.3f}"
+              f"{(float(np.median(b['ranks'])) if b['ranks'] else float('nan')):>7.1f}"
+              f"{1000*np.median(b['minz']):>11.1f}{1000*np.median(b['chosen_minz']):>13.1f}"
+              f"{1000*np.median(b['dxy_at_min']):>14.1f}")
+    print("\nf(desc) = fraction of gripper-open replans with >=1 descent candidate")
+    print("rank    = median position of the best descent candidate under the CURRENT score (0 = already chosen)")
+    print("mm, medians over gripper-open replans")
 
 
 if __name__ == "__main__":
