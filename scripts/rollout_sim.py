@@ -232,6 +232,16 @@ def main() -> int:
         "replan) so the logged data is 5 Hz per-tick like the demonstrations, at the cost of 4x the rendering.",
     )
     parser.add_argument(
+        "--dump-candidates",
+        action="store_true",
+        help="D2: store ALL K mode-lock candidate chunks per replan, not just the winner. "
+        "Only the selected chunk has ever been written, so 'a better ranking rule would have "
+        "won this episode' and 'the model never proposed a good chunk' are indistinguishable "
+        "offline -- that is the difference between a selection problem (fix the rule) and a "
+        "generation problem (fix the data). Adds replanNNN_cands (K, T_p, 7), _cand_score (K,) "
+        "and _cand_ends (K, 3); ~7 KB per replan at K=32.",
+    )
+    parser.add_argument(
         "--expert-stateless",
         action="store_true",
         help="A4: derive the expert's phase from the current pose and gripper instead of carrying it forward. "
@@ -943,6 +953,9 @@ def _run(args) -> int:
                 obs["goal"] = goal_vec
             cur_xy = obs["state"][-1, 0:2].numpy()
             cur_z = float(obs["state"][-1, 2])
+            # reset every replan: only the mode-lock branch fills it, and a stale
+            # dump from the previous replan would be silently mislabelled
+            cand_dump = None
             if replay is not None:
                 # same act_horizon chunking the policy gets, so the executor sees
                 # an identically-shaped stream; the actions just come from disk
@@ -1015,6 +1028,23 @@ def _run(args) -> int:
                     # grasp, exactly as a candidate ending 12 cm to the side is.
                     score = np.hypot(score, ends_z - args.mode_lock_grasp_z)
                 sel = int(np.argmin(score))
+                if args.dump_candidates:
+                    assert preds.shape == (args.mode_lock, cfg.pred_horizon, 7), (
+                        f"--dump-candidates: expected ({args.mode_lock}, {cfg.pred_horizon}, 7) "
+                        f"candidates, got {preds.shape}"
+                    )
+                    if ep == 0 and step == 0:
+                        print(f"dump-candidates ACTIVE: {preds.shape} per replan")
+                    # every candidate the selector chose FROM, with the score it
+                    # was ranked by, so an offline re-ranking can be evaluated
+                    # against the same K the run actually saw
+                    cand_dump = {
+                        "cands": preds.astype(np.float32),
+                        "cand_score": score.astype(np.float32),
+                        "cand_ends": np.concatenate(
+                            [ends, ends_z[:, None]], axis=1
+                        ).astype(np.float32),
+                    }
             else:
                 out = policy.predict_action(obs, z=z_ep, k=1)  # z held fixed for the episode
                 sel = 0
@@ -1056,6 +1086,7 @@ def _run(args) -> int:
                         "action_pred": out["action_pred"][sel].cpu().numpy(),
                         "mode_lock_sel": np.int64(sel),
                         "commit_xy": (np.zeros(2, dtype=np.float32) if commit_xy is None else commit_xy.astype(np.float32)),
+                        **(cand_dump or {}),
                     }
                 )
 
