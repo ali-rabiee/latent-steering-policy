@@ -1413,6 +1413,12 @@ def _run(args) -> int:
             reached=str(reached_leaf),
             approached=str(approached),
             max_lift_m=np.float32(max_lift_seen),
+            # per-episode grasp diagnostics, previously only ever aggregated into
+            # summary.json as a median: 0.93-0.98 rad means the box is between the
+            # fingers, 1.20 is the travel limit -- shut on nothing (G0d2).
+            max_finger_rad=np.float32(max_finger_rad),
+            max_box_move_m=np.float32(max_box_move),
+            tgt_err_median_m=np.float32(np.median(tgt_err) if tgt_err else np.nan),
             closest_ids=np.array(sorted(closest.keys())),
             closest_dist=np.array([closest[k] for k in sorted(closest.keys())], dtype=np.float32),
             label=label,
@@ -1487,6 +1493,9 @@ def _run(args) -> int:
         ),
         "ckpt": str(args.ckpt),
         "seed": args.seed,
+        # the per-episode records themselves. They were computed and then thrown
+        # away, so every per-box question had to be re-derived from the npz.
+        "per_episode": results,
     }
     _g = [r["gain_median"] for r in results if r.get("gain_median") == r.get("gain_median")]
     if _g:

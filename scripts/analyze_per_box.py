@@ -27,6 +27,13 @@ import numpy as np
 RESIDUAL_MAX_M = 0.01
 
 
+def _med(vals) -> float:
+    """Median ignoring nan; nan when a column is absent from an older run."""
+    a = np.asarray(vals, dtype=float)
+    a = a[~np.isnan(a)]
+    return float(np.median(a)) if a.size else float("nan")
+
+
 def _commanded(d, ep_idx: int, ids: list[str]) -> tuple[str, dict]:
     """Return the commanded leaf id plus the per-grouping votes that produced it."""
     votes: dict[str, str] = {}
@@ -88,6 +95,8 @@ def load(dirs: list[Path]) -> tuple[list[dict], list[str], np.ndarray, np.ndarra
                     "reached_label": str(d["label"]),
                     "never_closed": str(d["label"]) == "",
                     "max_finger_rad": float(d["max_finger_rad"]) if "max_finger_rad" in d.files else float("nan"),
+                    "tgt_err_mm": (float(d["tgt_err_median_m"]) * 1000.0
+                                   if "tgt_err_median_m" in d.files else float("nan")),
                     "max_lift_m": float(d["max_lift_m"]),
                     "closest_cmd_mm": cl.get(cmd, float("nan")) * 1000.0,
                     "min_ee_z": min(zs) if zs else float("nan"),
@@ -139,10 +148,11 @@ def main() -> None:
                 "success": float(np.mean([e["success"] for e in sel])),
                 "r_base_m": round(r_base, 4),
                 "r_home_m": round(r_home, 4),
-                "closest_mm_median": round(float(np.nanmedian([e["closest_cmd_mm"] for e in sel])), 2),
-                "max_finger_median": round(float(np.nanmedian([e["max_finger_rad"] for e in sel])), 4),
+                "closest_mm_median": round(_med([e["closest_cmd_mm"] for e in sel]), 2),
+                "max_finger_median": round(_med([e["max_finger_rad"] for e in sel]), 4),
+                "tgt_err_mm_median": round(_med([e["tgt_err_mm"] for e in sel]), 3),
                 "never_closed": round(float(np.mean([e["never_closed"] for e in sel])), 3),
-                "min_ee_z_median": round(float(np.nanmedian([e["min_ee_z"] for e in sel])), 4),
+                "min_ee_z_median": round(_med([e["min_ee_z"] for e in sel]), 4),
                 "below_8cm_frac": round(float(np.mean([e["min_ee_z"] < 0.08 for e in sel])), 3),
                 "replans_median": float(np.median([e["n_replans"] for e in sel])),
             }
@@ -150,14 +160,15 @@ def main() -> None:
     rows.sort(key=lambda r: -r["r_base_m"])
 
     hdr = ("box", "n", "success", "r_base", "r_home", "closest_mm", "finger",
-           "never_cl", "min_z", "<8cm", "replans")
+           "tgterr_mm", "never_cl", "min_z", "<8cm", "replans")
     print()
     print(f"{hdr[0]:<10}{hdr[1]:>5}{hdr[2]:>9}{hdr[3]:>8}{hdr[4]:>8}"
-          f"{hdr[5]:>11}{hdr[6]:>8}{hdr[7]:>9}{hdr[8]:>8}{hdr[9]:>7}{hdr[10]:>9}")
+          f"{hdr[5]:>11}{hdr[6]:>8}{hdr[7]:>11}{hdr[8]:>9}{hdr[9]:>8}{hdr[10]:>7}{hdr[11]:>9}")
     for r in rows:
         print(f"{r['box']:<10}{r['n']:>5}{r['success']*100:>8.1f}%{r['r_base_m']:>8.3f}"
               f"{r['r_home_m']:>8.3f}{r['closest_mm_median']:>11.2f}"
-              f"{r['max_finger_median']:>8.3f}{r['never_closed']*100:>8.1f}%"
+              f"{r['max_finger_median']:>8.3f}{r['tgt_err_mm_median']:>11.2f}"
+              f"{r['never_closed']*100:>8.1f}%"
               f"{r['min_ee_z_median']:>8.3f}{r['below_8cm_frac']*100:>6.0f}%"
               f"{r['replans_median']:>9.0f}")
     n = len(eps)
