@@ -1565,13 +1565,21 @@ def _run(args) -> int:
             "episodes_that_closed": len(closes),
         }
     if any(r["commanded"] for r in results):
+        # WARNING: this is keyed on `reached`, which is recorded at the FIRST
+        # GRIPPER CLOSE and is None when the episode never closes. So it measures
+        # "closed on the right box", NOT "went to the right box", and it collapses
+        # on any cell that fails to close: seed 2's Obj_01 reads 35% here while
+        # its timing-free obedience (per_command_closest_approach, below) is 100%.
+        # It is the same trap as `label` -- an outcome standing in for a command.
+        # For steering, read per_command_closest_approach. Kept for continuity.
         per_cmd: dict[str, dict[str, int]] = {}
         for r in results:
             c = per_cmd.setdefault(r["commanded"], {"n": 0, "correct": 0})
             c["n"] += 1
             c["correct"] += int(r["reached"] == r["commanded"])
         summary["per_command"] = {
-            k: {"n": v["n"], "correct": v["correct"], "accuracy": v["correct"] / max(1, v["n"])}
+            k: {"n": v["n"], "correct": v["correct"], "accuracy": v["correct"] / max(1, v["n"]),
+                "metric": "closed on this box; NOT steering -- see per_command_closest_approach"}
             for k, v in sorted(per_cmd.items())
         }
         per_cmd_app: dict[str, dict[str, float]] = {}
