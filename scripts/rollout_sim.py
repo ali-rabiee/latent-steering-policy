@@ -232,6 +232,23 @@ def main() -> int:
         "replan) so the logged data is 5 Hz per-tick like the demonstrations, at the cost of 4x the rendering.",
     )
     parser.add_argument(
+        "--exec-stall-break",
+        type=int,
+        default=0,
+        help="A11: break the approach deadlock. MEASURED on seed 2 (D2 dumps): with the gripper open "
+        "and the arm 16-50 mm from the commanded box, ALL 32 candidates on the failing cell end FURTHER "
+        "away than the arm already is (median best 56.4 mm from a current 36.8 mm), so it can never "
+        "enter the zone where it proposes a descent -- descent proposals run 0.63-0.93 below 5 mm of xy "
+        "error and 0.000 above 50 mm. After N consecutive such replans, drive the xy residual directly "
+        "for one chunk and hand back. 0 disables.",
+    )
+    parser.add_argument(
+        "--stall-break-step",
+        type=float,
+        default=0.02,
+        help="A11: per-action xy step of the stall breaker, metres.",
+    )
+    parser.add_argument(
         "--dump-candidates",
         action="store_true",
         help="D2: store ALL K mode-lock candidate chunks per replan, not just the winner. "
@@ -806,6 +823,8 @@ def _run(args) -> int:
         latched = False
         grip_full = None  # A6: untruncated gripper schedule (expert/replay never set it)
         commit_xy = None  # E1 mode-lock: xy endpoint committed at the first replan
+        stall_n = 0       # A11: consecutive replans stuck outside the descent-trigger zone
+        stall_fires = 0
         commanded_leaf = None
         goal_vec = None
         if args.expert:
@@ -953,9 +972,10 @@ def _run(args) -> int:
                 obs["goal"] = goal_vec
             cur_xy = obs["state"][-1, 0:2].numpy()
             cur_z = float(obs["state"][-1, 2])
-            # reset every replan: only the mode-lock branch fills it, and a stale
-            # dump from the previous replan would be silently mislabelled
+            # reset every replan: only the mode-lock branch fills these, and a
+            # stale value from the previous replan would be silently mislabelled
             cand_dump = None
+            ends = None
             if replay is not None:
                 # same act_horizon chunking the policy gets, so the executor sees
                 # an identically-shaped stream; the actions just come from disk
@@ -1057,6 +1077,37 @@ def _run(args) -> int:
             if not args.expert and replay is None:
                 actions = out["action"][sel].cpu().numpy()  # (T_a, 7)
                 grip_full = None
+                if args.exec_stall_break > 0 and commit_xy is not None and gripper == schema.GRIPPER_OPEN:
+                    # A11: is the arm parked in the dead zone with nothing on offer
+                    # that closes the gap? `ends` exists only on the mode-lock path.
+                    err = float(np.linalg.norm(cur_xy - commit_xy))
+                    reachable = (
+                        True if ends is None
+                        else bool((np.linalg.norm(ends - commit_xy[None], axis=1) <= 0.016).any())
+                    )
+                    if 0.016 <= err < 0.050 and not reachable:
+                        stall_n += 1
+                    else:
+                        stall_n = 0
+                    if stall_n >= args.exec_stall_break:
+                        # straight-line xy correction at the current height; the
+                        # gripper channel is held OPEN so this cannot manufacture
+                        # a close (inference-side close gates are dead, 0.0%)
+                        d_xy = commit_xy - cur_xy
+                        n_act = max(1, len(actions))
+                        step = np.clip(
+                            d_xy / n_act, -args.stall_break_step, args.stall_break_step
+                        )
+                        actions = np.zeros((n_act, 7), dtype=np.float32)
+                        actions[:, 0:2] = step[None, :]
+                        actions[:, 6] = schema.GRIPPER_OPEN
+                        stall_fires += 1
+                        stall_n = 0
+                        if ep == 0 and stall_fires == 1:
+                            print(
+                                f"stall-break ACTIVE: fired at xy err {err*1000:.1f} mm, "
+                                f"commanding {np.linalg.norm(d_xy)*1000:.1f} mm over {n_act} actions"
+                            )
                 if args.exec_act_horizon > 0:
                     # A5: execute fewer of the predicted actions before re-planning.
                     # MEASURED motivation: the scripted expert re-observes after
@@ -1371,6 +1422,7 @@ def _run(args) -> int:
         approached = min(closest, key=closest.get) if closest else None
         results.append({"episode": ep, "success": success, "reached": reached_leaf, "label": label,
                         "commanded": commanded_leaf, "commanded_label": commanded_label,
+                        "stall_breaks": int(stall_fires),
                         "approached": approached,
                         "max_lift_m": round(float(max_lift_seen), 4),
                         "max_finger_rad": round(float(max_finger_rad), 4),
@@ -1524,6 +1576,8 @@ def _run(args) -> int:
         ),
         "ckpt": str(args.ckpt),
         "seed": args.seed,
+        "stall_breaks_total": int(sum(r.get("stall_breaks", 0) for r in results)),
+        "stall_break_episodes": int(sum(1 for r in results if r.get("stall_breaks", 0) > 0)),
         # the per-episode records themselves. They were computed and then thrown
         # away, so every per-box question had to be re-derived from the npz.
         "per_episode": results,
