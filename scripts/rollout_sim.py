@@ -497,6 +497,7 @@ def _run(args) -> int:
         f" | mode_lock_grasp_z={args.mode_lock_grasp_z if args.mode_lock_grasp_z > 0 else 'off (xy-only)'}"
     )
 
+    _stall_announced = False  # A11: print the first stall-break in the RUN, not in ep 0
     n_phys = max(1, round((1.0 / schema.FPS) / h.dt))
     steps_per_episode = int(args.max_duration_s * schema.FPS)
     # render at ~60 Hz (vla_v1's throttle) — rendering every physics step tanks FPS
@@ -1095,17 +1096,21 @@ def _run(args) -> int:
                         # a close (inference-side close gates are dead, 0.0%)
                         d_xy = commit_xy - cur_xy
                         n_act = max(1, len(actions))
-                        step = np.clip(
+                        # NOT `step` -- that is the episode's tick counter, and
+                        # shadowing it turned `while step < steps_per_episode`
+                        # into an array comparison (job 64005477, all four tasks)
+                        d_step = np.clip(
                             d_xy / n_act, -args.stall_break_step, args.stall_break_step
                         )
                         actions = np.zeros((n_act, 7), dtype=np.float32)
-                        actions[:, 0:2] = step[None, :]
+                        actions[:, 0:2] = d_step[None, :]
                         actions[:, 6] = schema.GRIPPER_OPEN
                         stall_fires += 1
                         stall_n = 0
-                        if ep == 0 and stall_fires == 1:
+                        if not _stall_announced:
+                            _stall_announced = True
                             print(
-                                f"stall-break ACTIVE: fired at xy err {err*1000:.1f} mm, "
+                                f"stall-break ACTIVE (ep {ep}): fired at xy err {err*1000:.1f} mm, "
                                 f"commanding {np.linalg.norm(d_xy)*1000:.1f} mm over {n_act} actions"
                             )
                 if args.exec_act_horizon > 0:
