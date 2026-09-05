@@ -243,6 +243,23 @@ def main() -> int:
         "for one chunk and hand back. 0 disables.",
     )
     parser.add_argument(
+        "--stall-break-lo",
+        type=float,
+        default=0.016,
+        help="A11: lower xy-error bound of the stall regime, metres.",
+    )
+    parser.add_argument(
+        "--stall-break-hi",
+        type=float,
+        default=0.100,
+        help="A11: upper xy-error bound, metres. MEASURED, not guessed: on seed 2's failing cell "
+        "77%% of gripper-open replans sit at 50-100 mm and the last eight replans of an episode "
+        "have a median error of 74.0 mm -- the arm does NOT hover at 2-4 cm, it parks at ~7 cm. "
+        "The first attempt (A11b) capped this at 0.050 and fired once in 40 episodes. At 0.100 the "
+        "gate reaches 3+ consecutive replans in 40/40 Obj_01 and 23/40 Obj_04 episodes while "
+        "touching the working cells only 2/40 and 2/40.",
+    )
+    parser.add_argument(
         "--stall-break-step",
         type=float,
         default=0.02,
@@ -1086,7 +1103,7 @@ def _run(args) -> int:
                         True if ends is None
                         else bool((np.linalg.norm(ends - commit_xy[None], axis=1) <= 0.016).any())
                     )
-                    if 0.016 <= err < 0.050 and not reachable:
+                    if args.stall_break_lo <= err < args.stall_break_hi and not reachable:
                         stall_n += 1
                     else:
                         stall_n = 0
