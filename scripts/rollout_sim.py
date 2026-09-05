@@ -296,6 +296,23 @@ def main() -> int:
         "0 = off (gripper stays tied to the truncated chunk).",
     )
     parser.add_argument(
+        "--mode-lock-grasp-z",
+        type=float,
+        default=0.0,
+        metavar="Z",
+        help="A7: score mode-lock candidates in 3-D against the grasp point instead of XY only. "
+        "MEASURED motivation: the selector ranks the K sampled chunks by the XY distance from their "
+        "ENDPOINT to the commanded box, with no z term at all. Once the arm is over the box (4 mm in "
+        "XY) that term is near-constant across candidates, so the choice between 'descend onto the "
+        "box' and 'retreat 12 cm straight up' is effectively arbitrary. In the final-descent band "
+        "(0.045-0.12 m) failing episodes command ASCENT in 96.4% of approach chunks, median +116 mm, "
+        "and reverse vertical direction a median of 11 times per episode; successes command descent "
+        "65.1% of the time, median -41 mm, and reverse 3 times. Z is the target grasp height in BASE "
+        "frame - the measured median close height of 119 successful episodes is 0.055 (p10 0.045, "
+        "p90 0.065). Applied only while the gripper is still OPEN, so the lift is untouched. "
+        "0 = off (legacy XY-only scoring).",
+    )
+    parser.add_argument(
         "--exec-abs-max-step",
         type=float,
         default=0.0,
@@ -450,6 +467,7 @@ def _run(args) -> int:
         f" | actions={'ABSOLUTE' if getattr(cfg, 'absolute_actions', False) else 'delta'}"
         f" | act_horizon={args.exec_act_horizon if args.exec_act_horizon > 0 else 'full'}"
         f" | grip_lookahead={args.exec_grip_lookahead if args.exec_grip_lookahead > 0 else 'off'}"
+        f" | mode_lock_grasp_z={args.mode_lock_grasp_z if args.mode_lock_grasp_z > 0 else 'off (xy-only)'}"
     )
 
     n_phys = max(1, round((1.0 / schema.FPS) / h.dt))
@@ -924,6 +942,7 @@ def _run(args) -> int:
             if goal_vec is not None:
                 obs["goal"] = goal_vec
             cur_xy = obs["state"][-1, 0:2].numpy()
+            cur_z = float(obs["state"][-1, 2])
             if replay is not None:
                 # same act_horizon chunking the policy gets, so the executor sees
                 # an identically-shaped stream; the actions just come from disk
@@ -985,9 +1004,17 @@ def _run(args) -> int:
                 # collapsed commanded-box obedience to 0.0-0.9 (run A1_60k, void).
                 if getattr(cfg, "absolute_actions", False):
                     ends = preds[:, -1, 0:2]
+                    ends_z = preds[:, -1, 2]
                 else:
                     ends = cur_xy[None] + preds[:, :, 0:2].sum(axis=1)
-                sel = int(np.argmin(np.linalg.norm(ends - commit_xy[None], axis=1)))
+                    ends_z = cur_z + preds[:, :, 2].sum(axis=1)
+                score = np.linalg.norm(ends - commit_xy[None], axis=1)
+                if args.mode_lock_grasp_z > 0.0 and gripper == schema.GRIPPER_OPEN:
+                    # A7: isotropic 3-D distance to the grasp point. No weight to
+                    # tune: a candidate ending 12 cm high is 12 cm away from the
+                    # grasp, exactly as a candidate ending 12 cm to the side is.
+                    score = np.hypot(score, ends_z - args.mode_lock_grasp_z)
+                sel = int(np.argmin(score))
             else:
                 out = policy.predict_action(obs, z=z_ep, k=1)  # z held fixed for the episode
                 sel = 0
