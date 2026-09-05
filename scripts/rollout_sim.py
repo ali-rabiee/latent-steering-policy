@@ -1331,10 +1331,16 @@ def _run(args) -> int:
             if success and replay is None:
                 break
 
+        # NOTE: `label` is the box the gripper CLOSED ON, not the box the episode
+        # was told to fetch, and "" means "never closed" rather than "no command".
+        # Grouping any analysis by it silently groups by outcome. The commanded box
+        # is recorded separately below as commanded_label/commanded_id.
         label = h.id_to_label.get(reached_leaf or "", "")
+        commanded_label = h.id_to_label.get(commanded_leaf or "", "")
         approached = min(closest, key=closest.get) if closest else None
         results.append({"episode": ep, "success": success, "reached": reached_leaf, "label": label,
-                        "commanded": commanded_leaf, "approached": approached,
+                        "commanded": commanded_leaf, "commanded_label": commanded_label,
+                        "approached": approached,
                         "max_lift_m": round(float(max_lift_seen), 4),
                         "max_finger_rad": round(float(max_finger_rad), 4),
                         "max_box_move_m": round(float(max_box_move), 5),
@@ -1410,6 +1416,16 @@ def _run(args) -> int:
             closest_ids=np.array(sorted(closest.keys())),
             closest_dist=np.array([closest[k] for k in sorted(closest.keys())], dtype=np.float32),
             label=label,
+            # The box this episode was COMMANDED to fetch, as opposed to `label`
+            # (the box it closed on). commanded_pos_w is in the same world frame as
+            # layout_pos_w; subtract scene_origin to compare against replan*_commit_xy.
+            # All three are nan/"" when the episode carried no command.
+            commanded_label=commanded_label,
+            commanded_id=str(commanded_leaf),
+            commanded_pos_w=(
+                np.full(3, np.nan, dtype=np.float32) if commanded_leaf is None
+                else np.asarray(layout_w[commanded_leaf], dtype=np.float32)
+            ),
             layout_ids=np.array(sorted(layout_w.keys())),
             layout_pos_w=np.stack([layout_w[k] for k in sorted(layout_w.keys())]),
             # world->base offset, so offline analysis can assign endpoints to boxes
