@@ -62,6 +62,7 @@ def main() -> int:
         act_horizon=policy.cfg.act_horizon,
         camera_names=policy.cfg.camera_names,
         train=False,
+        goal_conditioned=getattr(policy.cfg, "goal_dim", 0) > 0,
     )
     idx = np.linspace(0, len(ds) - 1, min(args.frames, len(ds))).astype(int)
     g = torch.Generator(device=args.device).manual_seed(args.seed)
@@ -71,7 +72,7 @@ def main() -> int:
         sample = ds[int(i)]
         obs = {schema.camera_obs_key(c): sample[schema.camera_obs_key(c)] for c in policy.cfg.camera_names}
         obs["state"] = sample["state"]
-        if getattr(policy.cfg, "goal_dim", 0) > 0 and "goal" in sample:
+        if "goal" in sample:
             obs["goal"] = sample["goal"]
         out = policy.predict_action(obs, k=args.k, generator=g)
         p = out["action_pred"][0].cpu().numpy()          # (T_p, 7)
